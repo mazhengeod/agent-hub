@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent Hub MCP Server (v0.4.0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mazhengeod
+WorkingDirectory=/home/mazhengeod/agent-hub
+ExecStart=/home/mazhengeod/agent-hub/.venv/bin/python -m agent_hub.server
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

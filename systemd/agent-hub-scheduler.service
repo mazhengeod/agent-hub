@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent Hub Scheduler (v0.4.0)
+After=agent-hub.service
+Wants=agent-hub.service
+
+[Service]
+Type=simple
+User=mazhengeod
+WorkingDirectory=/home/mazhengeod/agent-hub
+ExecStart=/home/mazhengeod/agent-hub/.venv/bin/python -m agent_hub.scheduler
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
