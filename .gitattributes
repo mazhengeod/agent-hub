@@ -1,0 +1,6 @@
+*.py text eol=lf
+*.sql text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.service text eol=lf

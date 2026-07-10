@@ -33,6 +33,9 @@ class Adapter(BaseModel):
     wake_level: str = "L2"  # L3|L2
     is_healthy: bool = True
     last_success_at: Optional[str] = None
+    last_error: Optional[str] = None
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class Session(BaseModel):
@@ -61,7 +64,11 @@ class Task(BaseModel):
     deadline_at: Optional[str] = None
     budget_json: str = "{}"
     plan_version: int = 1
-    coordinator_run_id: Optional[str] = None
+    coordinator_agent_id: Optional[str] = None
+    coordinator_session_id: Optional[str] = None
+    coordinator_fencing_token: Optional[int] = None
+    coordinator_lease_expires_at: Optional[str] = None
+    blocked_reason_json: str = "{}"
     created_by_agent_id: str = ""
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -78,10 +85,12 @@ class WorkItem(BaseModel):
     required_capabilities_json: str = "[]"
     preferred_agent_id: Optional[str] = None
     status: str = "pending"
-    # pending|ready|offered|running|reviewing|succeeded|failed|blocked|changes_requested|cancelled
+    # pending|ready|offered|running|reviewing|succeeded|failed|blocked|cancelled
     priority: int = 0
     retry_policy_json: str = '{"max_attempts":3}'
     needs_review: bool = False
+    depth: int = 0
+    blocked_reason_json: str = "{}"
     version: int = 1
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -99,7 +108,7 @@ class Run(BaseModel):
     attempt_no: int
     agent_id: str
     session_id: Optional[str] = None
-    status: str = "offered"  # offered|claimed|running|succeeded|failed|lost|cancelled
+    status: str = "offered"  # offered|claimed|running|succeeded|failed|blocked|lost|cancelled
     fencing_token: int
     lease_expires_at: Optional[str] = None
     heartbeat_at: Optional[str] = None
@@ -163,6 +172,8 @@ class Approval(BaseModel):
     action: str  # deploy|external_msg|pr|budget_increase|scope_change|conflict
     reason: str = ""
     decision: Optional[str] = None  # None=pending|approved|rejected
+    previous_task_status: Optional[str] = None
+    previous_work_status: Optional[str] = None
     decided_by: Optional[str] = None
     decided_at: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

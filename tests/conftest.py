@@ -14,7 +14,7 @@ import pytest
 @pytest.fixture
 def db_path(tmp_path, monkeypatch):
     """Create a unique temp database for each test."""
-    from agent_hub import db, service
+    from agent_hub import db
 
     path = str(tmp_path / f"hub_{uuid.uuid4().hex}.db")
 
@@ -36,19 +36,10 @@ def db_path(tmp_path, monkeypatch):
         )
     conn.commit()
 
-    # Cache the connection - all get_db calls return the same conn
-    _cache = {"conn": conn}
-
-    def _cached_get_db(*_a, **_kw):
-        return _cache["conn"]
-
-    monkeypatch.setattr(db, "get_db", _cached_get_db)
-    monkeypatch.setattr(service, "get_db", _cached_get_db)
     monkeypatch.setattr(db, "DEFAULT_DB_PATH", Path(path))
 
-    yield path
-
     conn.close()
+    yield path
 
 
 @pytest.fixture

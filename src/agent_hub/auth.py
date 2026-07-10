@@ -31,7 +31,7 @@ def load_tokens() -> dict[str, str]:
 
     tokens = {}
     if TOKEN_FILE.exists():
-        with open(TOKEN_FILE) as f:
+        with open(TOKEN_FILE, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):

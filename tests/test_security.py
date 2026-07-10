@@ -152,3 +152,14 @@ def test_complete_run_invalid_status(db_path, claim_and_start):
     with pytest.raises(HubError) as exc:
         service.complete_run(run_id, token, "cancelled", "agent-a")
     assert exc.value.code == "invalid_status"
+
+
+def test_run_rejects_other_session_of_same_agent(db_path, claim_and_start, make_session):
+    result = claim_and_start("agent-a")
+    run = result["run"]
+    other = make_session("agent-a")
+    with pytest.raises(HubError) as exc:
+        service.heartbeat_run(
+            run["id"], run["fencing_token"], "agent-a",
+            session_id=other["session_id"])
+    assert exc.value.code == "run_session_mismatch"

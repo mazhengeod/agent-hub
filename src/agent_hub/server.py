@@ -57,11 +57,11 @@ async def hub_lifespan(app):
 async def _scheduler_loop():
     """Background reconcile loop. Runs in Hub lifespan (single process)."""
     while True:
-        await asyncio.sleep(RECONCILE_INTERVAL)
         try:
             await asyncio.to_thread(service.reconcile)
         except Exception:
             log.exception("Scheduler reconcile failed")
+        await asyncio.sleep(RECONCILE_INTERVAL)
 
 
 mcp = FastMCP("agent-hub", lifespan=hub_lifespan)
@@ -118,10 +118,12 @@ def task_create(objective: str,
 
 
 @mcp.tool()
-def task_get(task_id: str) -> dict:
+def task_get(task_id: str, include_graph: bool = False,
+             after_event_id: int = 0) -> dict:
     """Get task details."""
-    _agent_from_request()
-    result = service.get_task(task_id)
+    agent_id = _agent_from_request()
+    result = (service.task_snapshot(task_id, agent_id, after_event_id)
+              if include_graph else service.get_task(task_id, agent_id))
     if not result:
         raise HubError("task_not_found", f"Task {task_id} not found")
     return result
@@ -130,13 +132,15 @@ def task_get(task_id: str) -> dict:
 @mcp.tool()
 def task_list(status: Optional[str] = None, limit: int = 50) -> list[dict]:
     """List tasks."""
-    _agent_from_request()
-    return service.list_tasks(status=status, limit=limit)
+    agent_id = _agent_from_request()
+    return service.list_tasks(status=status, limit=limit, actor_agent_id=agent_id)
 
 
 @mcp.tool()
 def task_plan(task_id: str, work_items: list[dict],
-              dependencies: Optional[list[dict]] = None) -> dict:
+              dependencies: Optional[list[dict]] = None,
+              coordinator_token: Optional[int] = None,
+              coordinator_session_id: Optional[str] = None) -> dict:
     """Create work items and dependencies for a task.
 
     work_items: [{"kind":"implement", "objective":"...", "ref":"wi1",
@@ -144,14 +148,67 @@ def task_plan(task_id: str, work_items: list[dict],
     dependencies: [{"work_item":"wi1", "depends_on":"wi2", "condition":"succeeded"}]
     """
     agent_id = _agent_from_request()
-    return service.plan_task(task_id, work_items, dependencies, agent_id)
+    return service.plan_task(task_id, work_items, dependencies, agent_id,
+                             coordinator_token, coordinator_session_id)
 
 
 @mcp.tool()
-def task_start(task_id: str) -> dict:
+def task_start(task_id: str, coordinator_token: Optional[int] = None,
+               coordinator_session_id: Optional[str] = None) -> dict:
     """Transition a planned task to running."""
     agent_id = _agent_from_request()
-    return service.start_task(task_id, agent_id)
+    return service.start_task(task_id, agent_id, coordinator_token,
+                              coordinator_session_id)
+
+
+@mcp.tool()
+def task_cancel(task_id: str, reason: str = "",
+                coordinator_token: Optional[int] = None,
+                coordinator_session_id: Optional[str] = None) -> dict:
+    """Cancel a task and propagate cancellation to active work and runs."""
+    return service.cancel_task(task_id, _agent_from_request(), reason,
+                               coordinator_token, coordinator_session_id)
+
+
+@mcp.tool()
+def task_timeline(task_id: str, after_event_id: int = 0,
+                  limit: int = 200) -> list[dict]:
+    """Return the immutable task event timeline."""
+    return service.task_timeline(task_id, _agent_from_request(), after_event_id, limit)
+
+
+@mcp.tool()
+def task_explain(task_id: str) -> dict:
+    """Explain why a task is waiting and what should happen next."""
+    return service.task_explain(task_id, _agent_from_request())
+
+
+@mcp.tool()
+def task_participant_add(task_id: str, agent_id: str, role: str,
+                         coordinator_token: Optional[int] = None,
+                         coordinator_session_id: Optional[str] = None) -> dict:
+    """Add a task participant with an explicit role."""
+    return service.add_participant(task_id, agent_id, role, _agent_from_request(),
+                                   coordinator_token, coordinator_session_id)
+
+
+@mcp.tool()
+def coordinator_claim(task_id: str, session_id: str,
+                      lease_seconds: Optional[int] = None) -> dict:
+    return service.coordinator_claim(task_id, _agent_from_request(), session_id,
+                                     lease_seconds)
+
+
+@mcp.tool()
+def coordinator_heartbeat(task_id: str, fencing_token: int,
+                          lease_seconds: Optional[int] = None) -> dict:
+    return service.coordinator_heartbeat(task_id, _agent_from_request(), fencing_token,
+                                         lease_seconds)
+
+
+@mcp.tool()
+def coordinator_release(task_id: str, fencing_token: int) -> dict:
+    return service.coordinator_release(task_id, _agent_from_request(), fencing_token)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -168,6 +225,13 @@ def work_claim(session_id: str,
 
 
 @mcp.tool()
+def work_accept(run_id: str, session_id: str,
+                lease_seconds: Optional[int] = None) -> dict:
+    """Accept a scheduler-created offer."""
+    return service.accept_offer(run_id, session_id, _agent_from_request(), lease_seconds)
+
+
+@mcp.tool()
 def work_start(run_id: str, fencing_token: int, session_id: str,
                lease_seconds: Optional[int] = None) -> dict:
     """Transition a claimed run to running."""
@@ -176,29 +240,33 @@ def work_start(run_id: str, fencing_token: int, session_id: str,
 
 
 @mcp.tool()
-def work_progress(run_id: str, fencing_token: int,
+def work_progress(run_id: str, fencing_token: int, session_id: str,
                   lease_seconds: Optional[int] = None) -> dict:
     """Heartbeat a running run to renew its lease."""
     agent_id = _agent_from_request()
-    return service.heartbeat_run(run_id, fencing_token, agent_id, lease_seconds)
+    return service.heartbeat_run(run_id, fencing_token, agent_id, lease_seconds,
+                                 session_id)
 
 
 @mcp.tool()
-def work_checkpoint(run_id: str, fencing_token: int, snapshot: dict) -> dict:
+def work_checkpoint(run_id: str, fencing_token: int, session_id: str,
+                    snapshot: dict) -> dict:
     """Save a recovery checkpoint for a run."""
     agent_id = _agent_from_request()
-    return service.save_checkpoint(run_id, fencing_token, snapshot, agent_id)
+    return service.save_checkpoint(run_id, fencing_token, snapshot, agent_id,
+                                   session_id)
 
 
 @mcp.tool()
 def work_complete(run_id: str, fencing_token: int, status: str,
+                  session_id: str,
                   artifacts: Optional[list] = None,
                   failure_code: Optional[str] = None,
                   failure_detail: Optional[dict] = None) -> dict:
     """Complete a run. status: 'succeeded' or 'failed'."""
     agent_id = _agent_from_request()
     return service.complete_run(run_id, fencing_token, status, agent_id,
-                                artifacts, failure_code, failure_detail)
+                                artifacts, failure_code, failure_detail, session_id)
 
 
 @mcp.tool()
@@ -207,6 +275,32 @@ def work_resume(run_id: str, session_id: str,
     """Resume a lost run. Cross-agent allowed. Returns checkpoint for recovery."""
     agent_id = _agent_from_request()
     return service.resume_run(run_id, session_id, agent_id, lease_seconds)
+
+
+@mcp.tool()
+def work_spawn_child(run_id: str, fencing_token: int,
+                     session_id: str,
+                     work_items: list[dict],
+                     dependencies: Optional[list[dict]] = None) -> dict:
+    """Dynamically add child work within the current task budget."""
+    return service.spawn_child_work(run_id, fencing_token, _agent_from_request(),
+                                    work_items, dependencies, session_id)
+
+
+@mcp.tool()
+def work_block(run_id: str, fencing_token: int, session_id: str, blocker: dict,
+               checkpoint: Optional[dict] = None) -> dict:
+    """Persist a blocker and release the active Run."""
+    return service.block_work(run_id, fencing_token, _agent_from_request(),
+                              blocker, checkpoint, session_id)
+
+
+@mcp.tool()
+def work_unblock(work_item_id: str, note: str = "",
+                 coordinator_token: Optional[int] = None,
+                 coordinator_session_id: Optional[str] = None) -> dict:
+    return service.unblock_work(work_item_id, _agent_from_request(),
+                                coordinator_token, note, coordinator_session_id)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -234,7 +328,38 @@ def approval_request(task_id: str, action: str, reason: str = "",
 def approval_decide(approval_id: str, decision: str) -> dict:
     """Decide a pending approval."""
     agent_id = _agent_from_request()
-    return service.decide_approval(approval_id, decision, agent_id)
+    operators = set(get_config("operator_agent_ids", []))
+    return service.decide_approval(approval_id, decision, agent_id,
+                                   is_operator=agent_id in operators)
+
+
+@mcp.tool()
+def event_post(task_id: str, event_type: str, payload: Optional[dict] = None,
+               work_item_id: Optional[str] = None, run_id: Optional[str] = None,
+               recipients: Optional[list[str]] = None,
+               idempotency_key: Optional[str] = None) -> dict:
+    return service.post_event(task_id, _agent_from_request(), event_type, payload,
+                              work_item_id, run_id, recipients, idempotency_key)
+
+
+@mcp.tool()
+def adapter_register(mode: str, config: Optional[dict] = None,
+                     wake_level: str = "L2", adapter_id: Optional[str] = None) -> dict:
+    return service.register_adapter(_agent_from_request(), mode, config,
+                                    wake_level, adapter_id)
+
+
+@mcp.tool()
+def adapter_poll(adapter_id: str, limit: int = 20,
+                 lease_seconds: Optional[int] = None) -> dict:
+    return service.adapter_poll(_agent_from_request(), adapter_id, limit, lease_seconds)
+
+
+@mcp.tool()
+def adapter_ack(adapter_id: str, outbox_id: str, success: bool = True,
+                error: str = "") -> dict:
+    return service.adapter_ack(_agent_from_request(), adapter_id, outbox_id,
+                               success, error)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -267,20 +392,21 @@ def hub_status() -> dict:
 # ════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def lock_acquire(lock_key: str, holder_run_id: str,
+def lock_acquire(lock_key: str, holder_run_id: str, run_fencing_token: int,
                  resource_type: str = "general", resource_id: str = "",
                  ttl_seconds: int = 600) -> dict:
     """Acquire a resource lock."""
-    _agent_from_request()
+    agent_id = _agent_from_request()
     return service.acquire_lock(lock_key, holder_run_id,
-                                resource_type, resource_id, ttl_seconds)
+                                resource_type, resource_id, ttl_seconds, agent_id,
+                                run_fencing_token)
 
 
 @mcp.tool()
 def lock_release(lock_key: str, holder_run_id: str, fencing_token: int) -> dict:
     """Release a resource lock."""
-    _agent_from_request()
-    return service.release_lock(lock_key, holder_run_id, fencing_token)
+    agent_id = _agent_from_request()
+    return service.release_lock(lock_key, holder_run_id, fencing_token, agent_id)
 
 
 # ════════════════════════════════════════════════════════════════════

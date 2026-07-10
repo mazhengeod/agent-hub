@@ -117,10 +117,10 @@ def test_outbox_processed_by_reconcile(db_path, make_session):
 
     service.reconcile()
 
-    retried = conn.execute(
-        "SELECT COUNT(*) AS n FROM outbox WHERE status='pending' AND attempts > 0"
+    delivered = conn.execute(
+        "SELECT COUNT(*) AS n FROM outbox WHERE status='delivered'"
     ).fetchone()["n"]
-    assert retried > 0 or pending_before == 0
+    assert delivered > 0
 
 
 def test_outbox_survives_restart(db_path, make_session):

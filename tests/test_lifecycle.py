@@ -137,6 +137,7 @@ def test_review_rework_cycle(db_path, make_session):
     wi = storage.get_work_item(conn, wi.id)
     assert wi.status == "reviewing"
 
+    service.add_participant(task["id"], "reviewer", "reviewer", "agent-a")
     result = service.approve_work(wi.id, "reviewer", "rejected", "fix bugs")
     assert result["status"] == "ready"
 
@@ -167,6 +168,7 @@ def test_review_approved_completes_task(db_path, make_session):
     service.start_run(c1["run_id"], c1["fencing_token"], sess["session_id"], "agent-a")
     service.complete_run(c1["run_id"], c1["fencing_token"], "succeeded", "agent-a")
 
+    service.add_participant(task["id"], "reviewer", "reviewer", "agent-a")
     service.approve_work(wi.id, "reviewer", "approved", "ok")
     assert service.get_task(task["id"])["status"] == "completed"
 

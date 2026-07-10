@@ -40,13 +40,12 @@ def new_id() -> str:
 
 
 def next_fencing_token(conn: sqlite3.Connection) -> int:
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS _seq_fencing (n INTEGER NOT NULL DEFAULT 0)"
-    )
-    conn.execute("INSERT INTO _seq_fencing DEFAULT VALUES")
-    conn.execute("UPDATE _seq_fencing SET n = n + 1")
-    row = conn.execute("SELECT n FROM _seq_fencing").fetchone()
-    return row[0] if row else 1
+    row = conn.execute(
+        "UPDATE sequences SET value=value+1 WHERE name='fencing' RETURNING value"
+    ).fetchone()
+    if not row:
+        raise RuntimeError("fencing sequence is missing; database is not initialized")
+    return int(row[0])
 
 
 # ── Connection management ──────────────────────────────────────────

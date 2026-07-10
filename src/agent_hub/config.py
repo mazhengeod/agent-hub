@@ -25,7 +25,7 @@ def load_config() -> dict:
         return _config_cache
 
     if CONFIG_FILE.exists():
-        with open(CONFIG_FILE) as f:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
             _config_cache = yaml.safe_load(f) or {}
     else:
         _config_cache = {}

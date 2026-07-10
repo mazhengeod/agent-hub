@@ -1,9 +1,14 @@
 # Agent Hub 任务驱动的跨 Session、多 Agent 主动协作架构
 
-> 状态：架构审计后的重构方案（替代原“会话级通信优化方案”）  
+> 状态：v0.5 已实现（替代原“会话级通信优化方案”）
 > 日期：2026-07-10  
 > 范围：本机 Agent Hub（FastMCP + SQLite + systemd）及各 agent 接入规则/runner  
 > 核心目标：以任务结果为中心，允许任务跨 session 持续，多 agent 可并行、接力、复核，并在无人充当“邮差”时继续推进可自动推进的工作。
+
+> 实现说明：代码采用 clean-slate v2 schema，不提供旧 round/message/assignment
+> 数据兼容。Scheduler 已并入 FastMCP lifespan；Coordinator lease、动态 Work
+> Item、checkpoint 恢复、Event/Delivery/Outbox、approval gate、adapter polling
+> 和端到端测试均在 v0.5 落地。部署与 agent 接入步骤见仓库根目录 `README.md`。
 
 ---
 

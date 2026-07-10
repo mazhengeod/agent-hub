@@ -59,6 +59,56 @@ def list_agents(conn):
 
 
 # ════════════════════════════════════════════════════════════════════
+#  Adapters
+# ════════════════════════════════════════════════════════════════════
+
+def upsert_adapter(conn, adapter_id, agent_id, mode, config_json="{}", wake_level="L2"):
+    conn.execute(
+        """INSERT INTO adapters (id, agent_id, mode, config_json, wake_level, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET mode=excluded.mode,
+             config_json=excluded.config_json, wake_level=excluded.wake_level,
+             is_healthy=1, last_error=NULL, updated_at=excluded.updated_at""",
+        (adapter_id, agent_id, mode, config_json, wake_level, now_iso()))
+    return get_adapter(conn, adapter_id)
+
+
+def get_adapter(conn, adapter_id):
+    row = conn.execute("SELECT * FROM adapters WHERE id=?", (adapter_id,)).fetchone()
+    if not row:
+        return None
+    d = _row_dict(row)
+    d["is_healthy"] = bool(d["is_healthy"])
+    return Adapter(**d)
+
+
+def list_adapters(conn, agent_id=None, healthy_only=False):
+    clauses, params = [], []
+    if agent_id:
+        clauses.append("agent_id=?")
+        params.append(agent_id)
+    if healthy_only:
+        clauses.append("is_healthy=1")
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(f"SELECT * FROM adapters{where} ORDER BY created_at", params).fetchall()
+    result = []
+    for row in rows:
+        d = _row_dict(row)
+        d["is_healthy"] = bool(d["is_healthy"])
+        result.append(Adapter(**d))
+    return result
+
+
+def update_adapter_health(conn, adapter_id, healthy, error=None):
+    cur = conn.execute(
+        """UPDATE adapters SET is_healthy=?, last_error=?,
+           last_success_at=CASE WHEN ?=1 THEN ? ELSE last_success_at END,
+           updated_at=? WHERE id=?""",
+        (1 if healthy else 0, error, 1 if healthy else 0, now_iso(), now_iso(), adapter_id))
+    return cur.rowcount > 0
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Sessions
 # ════════════════════════════════════════════════════════════════════
 
@@ -131,6 +181,7 @@ def create_task(conn, task_id, objective, created_by_agent_id, **fields):
          fields.get("budget_json", "{}"),
          created_by_agent_id),
     )
+    add_task_participant(conn, task_id, created_by_agent_id, "owner")
     return get_task(conn, task_id)
 
 
@@ -144,13 +195,90 @@ def get_task(conn, task_id):
 def update_task_status(conn, task_id, status, **extra):
     sets = ["status=?", "updated_at=?"]
     vals = [status, now_iso()]
-    for k in ("completed_at", "coordinator_run_id", "plan_version"):
+    for k in ("completed_at", "plan_version", "blocked_reason_json"):
         if k in extra:
             sets.append(f"{k}=?")
             vals.append(extra[k])
     vals.append(task_id)
     cur = conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", vals)
     return cur.rowcount > 0
+
+
+def add_task_participant(conn, task_id, agent_id, role):
+    conn.execute(
+        "INSERT OR IGNORE INTO task_participants (task_id, agent_id, role) VALUES (?, ?, ?)",
+        (task_id, agent_id, role))
+
+
+def list_task_participants(conn, task_id):
+    rows = conn.execute(
+        "SELECT task_id, agent_id, role, created_at FROM task_participants WHERE task_id=? ORDER BY created_at",
+        (task_id,)).fetchall()
+    return [_row_dict(r) for r in rows]
+
+
+def is_task_participant(conn, task_id, agent_id):
+    row = conn.execute(
+        "SELECT 1 FROM task_participants WHERE task_id=? AND agent_id=? LIMIT 1",
+        (task_id, agent_id)).fetchone()
+    return row is not None
+
+
+def list_tasks_for_agent(conn, agent_id, status=None, limit=50):
+    sql = """SELECT DISTINCT t.* FROM tasks t
+             JOIN task_participants p ON p.task_id=t.id
+             WHERE p.agent_id=?"""
+    params = [agent_id]
+    if status:
+        sql += " AND t.status=?"
+        params.append(status)
+    sql += " ORDER BY t.priority DESC, t.created_at DESC LIMIT ?"
+    params.append(limit)
+    return [Task(**_row_dict(r)) for r in conn.execute(sql, params).fetchall()]
+
+
+def claim_coordinator(conn, task_id, agent_id, session_id, lease_expires_at):
+    token = next_fencing_token(conn)
+    cur = conn.execute(
+        """UPDATE tasks SET coordinator_agent_id=?, coordinator_session_id=?,
+           coordinator_fencing_token=?, coordinator_lease_expires_at=?, updated_at=?
+           WHERE id=? AND status IN ('draft','planned','ready','running','blocked')
+           AND (coordinator_agent_id IS NULL OR coordinator_lease_expires_at < ? OR coordinator_agent_id=?)""",
+        (agent_id, session_id, token, lease_expires_at, now_iso(), task_id, now_iso(), agent_id))
+    if not cur.rowcount:
+        return None
+    add_task_participant(conn, task_id, agent_id, "coordinator")
+    return token
+
+
+def heartbeat_coordinator(conn, task_id, agent_id, fencing_token, lease_expires_at):
+    cur = conn.execute(
+        """UPDATE tasks SET coordinator_lease_expires_at=?, updated_at=?
+           WHERE id=? AND coordinator_agent_id=? AND coordinator_fencing_token=?""",
+        (lease_expires_at, now_iso(), task_id, agent_id, fencing_token))
+    return cur.rowcount > 0
+
+
+def release_coordinator(conn, task_id, agent_id, fencing_token):
+    cur = conn.execute(
+        """UPDATE tasks SET coordinator_agent_id=NULL, coordinator_session_id=NULL,
+           coordinator_fencing_token=NULL, coordinator_lease_expires_at=NULL, updated_at=?
+           WHERE id=? AND coordinator_agent_id=? AND coordinator_fencing_token=?""",
+        (now_iso(), task_id, agent_id, fencing_token))
+    return cur.rowcount > 0
+
+
+def expire_stale_coordinators(conn):
+    rows = conn.execute(
+        "SELECT id, coordinator_agent_id FROM tasks WHERE coordinator_agent_id IS NOT NULL AND coordinator_lease_expires_at < ?",
+        (now_iso(),)).fetchall()
+    if rows:
+        conn.execute(
+            """UPDATE tasks SET coordinator_agent_id=NULL, coordinator_session_id=NULL,
+               coordinator_fencing_token=NULL, coordinator_lease_expires_at=NULL, updated_at=?
+               WHERE coordinator_agent_id IS NOT NULL AND coordinator_lease_expires_at < ?""",
+            (now_iso(), now_iso()))
+    return [_row_dict(r) for r in rows]
 
 
 def list_tasks(conn, status=None, limit=50):
@@ -174,15 +302,16 @@ def create_work_item(conn, task_id, kind, objective, **fields):
     conn.execute(
         """INSERT INTO work_items (id, task_id, parent_id, kind, objective,
            acceptance_json, required_capabilities_json, preferred_agent_id,
-           status, priority, retry_policy_json, needs_review)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
+           status, priority, retry_policy_json, needs_review, depth, blocked_reason_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
         (wi_id, task_id, fields.get("parent_id"), kind, objective,
          fields.get("acceptance_json", "[]"),
          fields.get("required_capabilities_json", "[]"),
          fields.get("preferred_agent_id"),
          fields.get("priority", 0),
          fields.get("retry_policy_json", '{"max_attempts":3}'),
-         1 if fields.get("needs_review") else 0),
+         1 if fields.get("needs_review") else 0,
+         fields.get("depth", 0), fields.get("blocked_reason_json", "{}")),
     )
     return get_work_item(conn, wi_id)
 
@@ -225,17 +354,38 @@ def get_dependents(conn, work_item_id):
     return [WorkDependency(**_row_dict(r)) for r in rows]
 
 
-def update_work_item_status(conn, wi_id, status, version=None):
+def update_work_item_status(conn, wi_id, status, version=None, blocked_reason_json=None):
+    reason_sql = ", blocked_reason_json=?" if blocked_reason_json is not None else ""
     if version is not None:
+        params = [status, now_iso()]
+        if blocked_reason_json is not None:
+            params.append(blocked_reason_json)
+        params.extend([wi_id, version])
         cur = conn.execute(
-            """UPDATE work_items SET status=?, version=version+1, updated_at=?
-               WHERE id=? AND version=?""",
-            (status, now_iso(), wi_id, version))
+            f"""UPDATE work_items SET status=?, version=version+1, updated_at=?{reason_sql}
+               WHERE id=? AND version=?""", params)
     else:
+        params = [status, now_iso()]
+        if blocked_reason_json is not None:
+            params.append(blocked_reason_json)
+        params.append(wi_id)
         cur = conn.execute(
-            "UPDATE work_items SET status=?, version=version+1, updated_at=? WHERE id=?",
-            (status, now_iso(), wi_id))
+            f"UPDATE work_items SET status=?, version=version+1, updated_at=?{reason_sql} WHERE id=?",
+            params)
     return cur.rowcount > 0
+
+
+def count_work_items(conn, task_id):
+    row = conn.execute("SELECT COUNT(*) AS n FROM work_items WHERE task_id=?", (task_id,)).fetchone()
+    return row["n"] if row else 0
+
+
+def cancel_work_items_for_task(conn, task_id):
+    cur = conn.execute(
+        """UPDATE work_items SET status='cancelled', version=version+1, updated_at=?
+           WHERE task_id=? AND status NOT IN ('succeeded','failed','cancelled')""",
+        (now_iso(), task_id))
+    return cur.rowcount
 
 
 def list_work_items(conn, task_id, status=None):
@@ -256,14 +406,21 @@ def list_work_items(conn, task_id, status=None):
 
 
 def list_ready_work_items(conn, agent_id=None, limit=20):
-    rows = conn.execute(
-        """SELECT wi.* FROM work_items wi
-           JOIN tasks t ON wi.task_id = t.id
-           WHERE wi.status = 'ready' AND t.status = 'running'
-           AND (wi.preferred_agent_id IS NULL OR wi.preferred_agent_id = ?)
-           ORDER BY wi.priority DESC, wi.created_at
-           LIMIT ?""",
-        (agent_id, limit)).fetchall()
+    if agent_id is None:
+        rows = conn.execute(
+            """SELECT wi.* FROM work_items wi JOIN tasks t ON wi.task_id=t.id
+               WHERE wi.status='ready' AND t.status='running'
+               ORDER BY wi.priority DESC, wi.created_at LIMIT ?""",
+            (limit,)).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT wi.* FROM work_items wi
+               JOIN tasks t ON wi.task_id = t.id
+               WHERE wi.status = 'ready' AND t.status = 'running'
+               AND (wi.preferred_agent_id IS NULL OR wi.preferred_agent_id = ?)
+               ORDER BY wi.priority DESC, wi.created_at
+               LIMIT ?""",
+            (agent_id, limit)).fetchall()
     result = []
     for r in rows:
         d = _row_dict(r)
@@ -340,6 +497,14 @@ def complete_run(conn, run_id, fencing_token, status, failure_code=None, failure
     return cur.rowcount > 0
 
 
+def block_run(conn, run_id, fencing_token, failure_code="blocked", failure_json="{}"):
+    cur = conn.execute(
+        """UPDATE runs SET status='blocked', failure_code=?, failure_json=?, ended_at=?
+           WHERE id=? AND fencing_token=? AND status='running'""",
+        (failure_code, failure_json, now_iso(), run_id, fencing_token))
+    return cur.rowcount > 0
+
+
 def cancel_run(conn, run_id, fencing_token):
     cur = conn.execute(
         "UPDATE runs SET status='cancelled', ended_at=? WHERE id=? AND fencing_token=? AND status IN ('offered','claimed','running')",
@@ -360,6 +525,20 @@ def expire_stale_runs(conn):
     return lost_ids
 
 
+def cancel_active_runs_for_task(conn, task_id):
+    rows = conn.execute(
+        """SELECT r.id FROM runs r JOIN work_items wi ON wi.id=r.work_item_id
+           WHERE wi.task_id=? AND r.status IN ('offered','claimed','running','blocked')""",
+        (task_id,)).fetchall()
+    ids = [r["id"] for r in rows]
+    if ids:
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(
+            f"UPDATE runs SET status='cancelled', ended_at=? WHERE id IN ({placeholders})",
+            [now_iso()] + ids)
+    return ids
+
+
 def list_runs_for_agent(conn, agent_id, status=None):
     if status:
         rows = conn.execute(
@@ -369,6 +548,48 @@ def list_runs_for_agent(conn, agent_id, status=None):
         rows = conn.execute(
             "SELECT * FROM runs WHERE agent_id=? ORDER BY created_at DESC",
             (agent_id,)).fetchall()
+    return [Run(**_row_dict(r)) for r in rows]
+
+
+def count_active_runs_for_agent(conn, agent_id):
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM runs WHERE agent_id=? AND status IN ('offered','claimed','running')",
+        (agent_id,)).fetchone()
+    return row["n"] if row else 0
+
+
+def list_offered_runs_for_agent(conn, agent_id, limit=20):
+    rows = conn.execute(
+        "SELECT * FROM runs WHERE agent_id=? AND status='offered' ORDER BY created_at LIMIT ?",
+        (agent_id, limit)).fetchall()
+    return [Run(**_row_dict(r)) for r in rows]
+
+
+def get_latest_successful_run(conn, work_item_id):
+    row = conn.execute(
+        "SELECT * FROM runs WHERE work_item_id=? AND status='succeeded' ORDER BY attempt_no DESC LIMIT 1",
+        (work_item_id,)).fetchone()
+    return Run(**_row_dict(row)) if row else None
+
+
+def count_runs_for_task(conn, task_id):
+    """Count total runs for a task (for budget/circuit-breaker checks)."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM runs WHERE work_item_id IN "
+        "(SELECT id FROM work_items WHERE task_id=?)",
+        (task_id,)).fetchone()
+    return row["n"] if row else 0
+
+
+def list_runs_for_work_item(conn, work_item_id, status=None):
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM runs WHERE work_item_id=? AND status=? ORDER BY attempt_no",
+            (work_item_id, status)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM runs WHERE work_item_id=? ORDER BY attempt_no",
+            (work_item_id,)).fetchall()
     return [Run(**_row_dict(r)) for r in rows]
 
 
@@ -404,7 +625,7 @@ def get_latest_checkpoint_for_work_item(conn, work_item_id):
         """SELECT c.* FROM checkpoints c
            JOIN runs r ON c.run_id = r.id
            WHERE r.work_item_id=?
-           ORDER BY c.version DESC LIMIT 1""",
+           ORDER BY r.attempt_no DESC, c.version DESC LIMIT 1""",
         (work_item_id,)).fetchone()
     if not row:
         return None
@@ -436,6 +657,13 @@ def list_artifacts(conn, task_id=None, work_item_id=None):
     return [Artifact(**_row_dict(r)) for r in rows]
 
 
+def list_events(conn, task_id, after_event_id=0, limit=200):
+    rows = conn.execute(
+        "SELECT * FROM events WHERE task_id=? AND event_id>? ORDER BY event_id LIMIT ?",
+        (task_id, after_event_id, limit)).fetchall()
+    return [Event(**_row_dict(r)) for r in rows]
+
+
 # ════════════════════════════════════════════════════════════════════
 #  Events + Deliveries + Outbox  (the reliability pipeline)
 # ════════════════════════════════════════════════════════════════════
@@ -445,8 +673,8 @@ def append_event(conn, task_id, event_type, actor_agent_id=None,
                  idempotency_key=None):
     if idempotency_key and actor_agent_id:
         existing = conn.execute(
-            "SELECT * FROM events WHERE actor_agent_id=? AND idempotency_key=?",
-            (actor_agent_id, idempotency_key)).fetchone()
+            "SELECT * FROM events WHERE task_id=? AND actor_agent_id=? AND idempotency_key=?",
+            (task_id, actor_agent_id, idempotency_key)).fetchone()
         if existing:
             return None
     cur = conn.execute(
@@ -474,7 +702,7 @@ def create_delivery(conn, event_id, recipient_kind, recipient_id, available_at=N
 
 def list_deliveries_since(conn, recipient_kind, recipient_id,
                           since_event_id=0, limit=50):
-    """Cursor-based delivery pull: unacked deliveries for events > since_event_id."""
+    """Return unacked deliveries. Cursor is a hint, never a loss boundary."""
     rows = conn.execute(
         """SELECT d.id AS delivery_id, d.event_id, d.status, d.available_at,
                   e.event_type, e.payload_json, e.task_id, e.work_item_id, e.run_id,
@@ -483,19 +711,18 @@ def list_deliveries_since(conn, recipient_kind, recipient_id,
            JOIN events e ON d.event_id = e.event_id
            WHERE d.recipient_kind=? AND d.recipient_id=?
            AND d.status='pending'
-           AND e.event_id > ?
            AND d.available_at <= ?
-           ORDER BY e.event_id ASC
+           ORDER BY CASE WHEN e.event_id>? THEN 0 ELSE 1 END, e.event_id ASC
            LIMIT ?""",
-        (recipient_kind, recipient_id, since_event_id, now_iso(), limit)).fetchall()
+        (recipient_kind, recipient_id, now_iso(), since_event_id, limit)).fetchall()
     return [_row_dict(r) for r in rows]
 
 
-def ack_delivery(conn, delivery_id, recipient_id):
+def ack_delivery(conn, delivery_id, recipient_id, recipient_kind="agent"):
     cur = conn.execute(
         """UPDATE deliveries SET status='acked', acked_at=?
-           WHERE id=? AND recipient_id=? AND status='pending'""",
-        (now_iso(), delivery_id, recipient_id))
+           WHERE id=? AND recipient_kind=? AND recipient_id=? AND status='pending'""",
+        (now_iso(), delivery_id, recipient_kind, recipient_id))
     return cur.rowcount > 0
 
 
@@ -506,49 +733,95 @@ def expire_stale_deliveries(conn):
     return cur.rowcount
 
 
-def enqueue_outbox(conn, event_type, payload_json, max_attempts=5):
+def enqueue_outbox(conn, event_type, payload_json, max_attempts=5, adapter_id=None,
+                   available_at=None):
     ob_id = new_id()
     conn.execute(
-        """INSERT INTO outbox (id, event_type, payload_json, status, max_attempts)
-           VALUES (?, ?, ?, 'pending', ?)""",
-        (ob_id, event_type, payload_json, max_attempts))
+        """INSERT INTO outbox (id, event_type, payload_json, adapter_id, status,
+           max_attempts, available_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+        (ob_id, event_type, payload_json, adapter_id, max_attempts,
+         available_at or now_iso()))
     return ob_id
 
 
 def list_pending_outbox(conn, limit=20):
     rows = conn.execute(
         """SELECT * FROM outbox WHERE status='pending'
-           AND (retry_at IS NULL OR retry_at <= ?)
+           AND available_at <= ?
            ORDER BY created_at LIMIT ?""",
         (now_iso(), limit)).fetchall()
     return [_row_dict(r) for r in rows]
 
 
+def get_outbox(conn, outbox_id):
+    row = conn.execute("SELECT * FROM outbox WHERE id=?", (outbox_id,)).fetchone()
+    return _row_dict(row) if row else None
+
+
+def lease_outbox_for_adapter(conn, adapter_id, lease_seconds=60, limit=20):
+    rows = conn.execute(
+        """SELECT id FROM outbox WHERE adapter_id=? AND status='pending'
+           AND attempts < max_attempts
+           AND available_at<=? ORDER BY created_at LIMIT ?""",
+        (adapter_id, now_iso(), limit)).fetchall()
+    ids = [r["id"] for r in rows]
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    conn.execute(
+        f"UPDATE outbox SET status='leased', lease_expires_at=? WHERE id IN ({placeholders}) AND status='pending'",
+        [iso_plus_seconds(lease_seconds)] + ids)
+    return [_row_dict(r) for r in conn.execute(
+        f"SELECT * FROM outbox WHERE id IN ({placeholders}) AND status='leased' ORDER BY created_at",
+        ids).fetchall()]
+
+
 def mark_outbox_delivered(conn, outbox_id):
     conn.execute(
-        "UPDATE outbox SET status='delivered', delivered_at=? WHERE id=?",
+        """UPDATE outbox SET status='delivered', delivered_at=?, lease_expires_at=NULL,
+           last_error=NULL WHERE id=? AND status IN ('pending','leased')""",
         (now_iso(), outbox_id))
 
 
-def retry_outbox(conn, outbox_id):
+def retry_outbox(conn, outbox_id, error="dispatch_failed", delay_seconds=5):
     conn.execute(
-        "UPDATE outbox SET attempts=attempts+1, retry_at=? WHERE id=?",
-        (now_iso(), outbox_id))
+        """UPDATE outbox SET attempts=attempts+1, status='pending', available_at=?,
+           lease_expires_at=NULL, last_error=? WHERE id=? AND status IN ('pending','leased')""",
+        (iso_plus_seconds(delay_seconds), error, outbox_id))
 
 
-def dead_letter_outbox(conn, outbox_id):
-    conn.execute("UPDATE outbox SET status='dead_letter' WHERE id=?", (outbox_id,))
+def dead_letter_outbox(conn, outbox_id, error="max_attempts_exceeded"):
+    conn.execute(
+        "UPDATE outbox SET status='dead_letter', lease_expires_at=NULL, last_error=? WHERE id=?",
+        (error, outbox_id))
+
+
+def requeue_expired_outbox_leases(conn):
+    cur = conn.execute(
+        """UPDATE outbox SET status='pending', lease_expires_at=NULL,
+           attempts=attempts+1, last_error='lease_expired', available_at=?
+           WHERE status='leased' AND lease_expires_at < ?""",
+        (now_iso(), now_iso()))
+    return cur.rowcount
+
+
+def count_outbox_by_status(conn):
+    rows = conn.execute("SELECT status, COUNT(*) AS n FROM outbox GROUP BY status").fetchall()
+    return {r["status"]: r["n"] for r in rows}
 
 
 # ════════════════════════════════════════════════════════════════════
 #  Approvals
 # ════════════════════════════════════════════════════════════════════
 
-def create_approval(conn, task_id, action, reason="", work_item_id=None, run_id=None):
+def create_approval(conn, task_id, action, reason="", work_item_id=None, run_id=None,
+                    previous_task_status=None, previous_work_status=None):
     ap_id = new_id()
     conn.execute(
-        "INSERT INTO approvals (id, task_id, work_item_id, run_id, action, reason) VALUES (?, ?, ?, ?, ?, ?)",
-        (ap_id, task_id, work_item_id, run_id, action, reason))
+        """INSERT INTO approvals (id, task_id, work_item_id, run_id, action, reason,
+           previous_task_status, previous_work_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (ap_id, task_id, work_item_id, run_id, action, reason,
+         previous_task_status, previous_work_status))
     row = conn.execute("SELECT * FROM approvals WHERE id=?", (ap_id,)).fetchone()
     return Approval(**_row_dict(row))
 
@@ -560,6 +833,11 @@ def decide_approval(conn, approval_id, decision, decided_by):
     return cur.rowcount > 0
 
 
+def get_approval(conn, approval_id):
+    row = conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+    return Approval(**_row_dict(row)) if row else None
+
+
 def list_pending_approvals(conn, task_id=None):
     if task_id:
         rows = conn.execute(
@@ -568,6 +846,15 @@ def list_pending_approvals(conn, task_id=None):
     else:
         rows = conn.execute(
             "SELECT * FROM approvals WHERE decision IS NULL ORDER BY created_at").fetchall()
+    return [Approval(**_row_dict(r)) for r in rows]
+
+
+def list_pending_approvals_for_agent(conn, agent_id):
+    rows = conn.execute(
+        """SELECT DISTINCT a.* FROM approvals a
+           JOIN task_participants p ON p.task_id=a.task_id
+           WHERE p.agent_id=? AND a.decision IS NULL ORDER BY a.created_at""",
+        (agent_id,)).fetchall()
     return [Approval(**_row_dict(r)) for r in rows]
 
 
@@ -621,6 +908,19 @@ def release_lock(conn, lock_key, holder_run_id, fencing_token):
         "DELETE FROM resource_locks WHERE lock_key=? AND holder_run_id=? AND fencing_token=?",
         (lock_key, holder_run_id, fencing_token))
     return cur.rowcount > 0
+
+
+def release_locks_by_run(conn, run_id):
+    """Release ALL locks held by a run. Used when a run completes/fails/lost."""
+    cur = conn.execute(
+        "DELETE FROM resource_locks WHERE holder_run_id=?", (run_id,))
+    return cur.rowcount
+
+
+def list_locks_by_run(conn, run_id):
+    rows = conn.execute(
+        "SELECT * FROM resource_locks WHERE holder_run_id=?", (run_id,)).fetchall()
+    return [ResourceLock(**_row_dict(r)) for r in rows]
 
 
 def get_lock(conn, lock_key):

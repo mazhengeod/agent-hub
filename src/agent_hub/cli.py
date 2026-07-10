@@ -94,7 +94,7 @@ def main(argv: Optional[list[str]] = None):
             print(f"Usage: hubctl {cmd} <approval_id>")
             return 1
         decision = "approved" if cmd == "approve" else "rejected"
-        result = service.decide_approval(argv[1], decision, "hubctl")
+        result = service.decide_approval(argv[1], decision, "hubctl", is_operator=True)
         print(json.dumps(result, indent=2))
 
     else:

@@ -36,6 +36,7 @@ def test_all_tables_exist(db_path):
         "schema_migrations", "agents", "adapters", "sessions", "tasks",
         "work_items", "work_dependencies", "runs", "checkpoints", "artifacts",
         "events", "deliveries", "outbox", "approvals", "resource_locks",
+        "task_participants", "sequences",
     ]
     for table in expected:
         row = conn.execute(
@@ -61,6 +62,7 @@ def test_sql_split_handles_strings():
 def test_events_autoincrement(db_path):
     conn = db.get_db(db_path)
     conn.execute("BEGIN")
+    conn.execute("INSERT INTO tasks (id, objective, created_by_agent_id) VALUES ('t1','test','agent-a')")
     conn.execute("INSERT INTO events (task_id, event_type) VALUES ('t1', 'a')")
     conn.execute("INSERT INTO events (task_id, event_type) VALUES ('t1', 'b')")
     conn.execute("COMMIT")
@@ -72,6 +74,7 @@ def test_events_autoincrement(db_path):
 def test_delivery_unique_constraint(db_path):
     conn = db.get_db(db_path)
     conn.execute("BEGIN")
+    conn.execute("INSERT INTO tasks (id, objective, created_by_agent_id) VALUES ('t1','test','agent-a')")
     conn.execute("INSERT INTO events (task_id, event_type) VALUES ('t1', 'e')")
     eid = conn.execute("SELECT event_id FROM events").fetchone()["event_id"]
     conn.execute(
@@ -87,3 +90,16 @@ def test_delivery_unique_constraint(db_path):
     except Exception:
         pass
     conn.execute("ROLLBACK")
+
+
+def test_fencing_sequence_uses_one_row(db_path):
+    from agent_hub.db import next_fencing_token
+    conn = db.get_db(db_path)
+    conn.execute("BEGIN")
+    values = [next_fencing_token(conn) for _ in range(5)]
+    conn.execute("COMMIT")
+    assert values == sorted(values)
+    assert len(set(values)) == 5
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM sequences WHERE name='fencing'").fetchone()
+    assert row["n"] == 1
