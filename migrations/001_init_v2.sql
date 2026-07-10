@@ -1,17 +1,16 @@
--- 002_task_runtime_v2.sql
--- Full v2 domain model: Task / Work Item / Run / Session / Checkpoint / Event / Delivery / Outbox / Approval / Lock
--- Replaces the v1 root_tasks/rounds/assignments/messages/handoffs/locks/operator_approvals/audit_events tables.
+-- 001_init_v2.sql
+-- Agent Hub v2 domain model. No legacy compatibility.
+-- Tables: agents, adapters, sessions, tasks, work_items, work_dependencies,
+--         runs, checkpoints, artifacts, events, deliveries, outbox,
+--         approvals, resource_locks.
+-- PRAGMAs are set in get_db(), not here (cannot run inside transaction).
 
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-PRAGMA busy_timeout=5000;
-
--- ── Agents ────────────────────────────────────────────────────────
+-- Agents
 CREATE TABLE IF NOT EXISTS agents (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
     capabilities    TEXT NOT NULL DEFAULT '[]',
-    token_hash      TEXT NOT NULL,
+    token_hash      TEXT NOT NULL DEFAULT '',
     is_active       INTEGER NOT NULL DEFAULT 1,
     last_heartbeat  TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -22,9 +21,9 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE TABLE IF NOT EXISTS adapters (
     id              TEXT PRIMARY KEY,
     agent_id        TEXT NOT NULL,
-    mode            TEXT NOT NULL,              -- resident_runner|cli_spawn|automation|online_session|manual_resume
+    mode            TEXT NOT NULL,
     config_json     TEXT NOT NULL DEFAULT '{}',
-    wake_level      TEXT NOT NULL DEFAULT 'L2', -- L3|L2
+    wake_level      TEXT NOT NULL DEFAULT 'L2',
     is_healthy      INTEGER NOT NULL DEFAULT 1,
     last_success_at TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -32,14 +31,14 @@ CREATE TABLE IF NOT EXISTS adapters (
 );
 CREATE INDEX IF NOT EXISTS idx_adapters_agent ON adapters(agent_id);
 
--- ── Sessions: short-lived execution endpoints ────────────────────
+-- ── Sessions: short-lived execution endpoints (multiple per agent) ─
 CREATE TABLE IF NOT EXISTS sessions (
     id                  TEXT PRIMARY KEY,
     agent_id            TEXT NOT NULL,
     native_session_ref  TEXT,
     adapter_id          TEXT,
     capabilities_json   TEXT NOT NULL DEFAULT '[]',
-    status              TEXT NOT NULL DEFAULT 'active', -- active|ended|lost
+    status              TEXT NOT NULL DEFAULT 'active',
     last_seen_at        TEXT NOT NULL,
     lease_expires_at    TEXT NOT NULL,
     created_at          TEXT NOT NULL DEFAULT (datetime('now')),
@@ -47,7 +46,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     FOREIGN KEY (agent_id) REFERENCES agents(id),
     FOREIGN KEY (adapter_id) REFERENCES adapters(id)
 );
-CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_sessions_agent_active ON sessions(agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_sessions_lease ON sessions(lease_expires_at) WHERE status='active';
 
 -- ── Tasks: the sole top-level business identity ──────────────────
@@ -59,7 +58,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     authorization_policy_json   TEXT NOT NULL DEFAULT '{}',
     context_refs_json           TEXT NOT NULL DEFAULT '[]',
     status                      TEXT NOT NULL DEFAULT 'draft',
-    -- draft|planned|ready|running|verifying|completed|failed|blocked|cancelled|archived
     priority                    INTEGER NOT NULL DEFAULT 0,
     deadline_at                 TEXT,
     budget_json                 TEXT NOT NULL DEFAULT '{}',
@@ -72,20 +70,18 @@ CREATE TABLE IF NOT EXISTS tasks (
     FOREIGN KEY (created_by_agent_id) REFERENCES agents(id)
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, priority DESC);
-CREATE INDEX IF NOT EXISTS idx_tasks_creator ON tasks(created_by_agent_id);
 
 -- ── Work Items: schedulable work units within a task ─────────────
 CREATE TABLE IF NOT EXISTS work_items (
     id                          TEXT PRIMARY KEY,
     task_id                     TEXT NOT NULL,
     parent_id                   TEXT,
-    kind                        TEXT NOT NULL,  -- plan|research|implement|review|verify|operate|summarize
+    kind                        TEXT NOT NULL,
     objective                   TEXT NOT NULL,
     acceptance_json             TEXT NOT NULL DEFAULT '[]',
     required_capabilities_json  TEXT NOT NULL DEFAULT '[]',
     preferred_agent_id          TEXT,
     status                      TEXT NOT NULL DEFAULT 'pending',
-    -- pending|ready|offered|running|reviewing|succeeded|failed|blocked|changes_requested|cancelled
     priority                    INTEGER NOT NULL DEFAULT 0,
     retry_policy_json           TEXT NOT NULL DEFAULT '{"max_attempts":3}',
     needs_review                INTEGER NOT NULL DEFAULT 0,
@@ -96,15 +92,14 @@ CREATE TABLE IF NOT EXISTS work_items (
     FOREIGN KEY (parent_id) REFERENCES work_items(id),
     FOREIGN KEY (preferred_agent_id) REFERENCES agents(id)
 );
-CREATE INDEX IF NOT EXISTS idx_work_items_task ON work_items(task_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_items_task_status ON work_items(task_id, status);
 CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(status, priority DESC);
-CREATE INDEX IF NOT EXISTS idx_work_items_parent ON work_items(parent_id);
 
 -- ── Work dependencies: DAG edges ─────────────────────────────────
 CREATE TABLE IF NOT EXISTS work_dependencies (
     work_item_id    TEXT NOT NULL,
     depends_on_id   TEXT NOT NULL,
-    condition       TEXT NOT NULL DEFAULT 'succeeded', -- succeeded|failed|completed
+    condition       TEXT NOT NULL DEFAULT 'succeeded',
     PRIMARY KEY (work_item_id, depends_on_id),
     FOREIGN KEY (work_item_id) REFERENCES work_items(id),
     FOREIGN KEY (depends_on_id) REFERENCES work_items(id)
@@ -118,7 +113,6 @@ CREATE TABLE IF NOT EXISTS runs (
     agent_id            TEXT NOT NULL,
     session_id          TEXT,
     status              TEXT NOT NULL DEFAULT 'offered',
-    -- offered|claimed|running|succeeded|failed|lost|cancelled
     fencing_token       INTEGER NOT NULL,
     lease_expires_at    TEXT,
     heartbeat_at        TEXT,
@@ -133,8 +127,8 @@ CREATE TABLE IF NOT EXISTS runs (
     FOREIGN KEY (agent_id) REFERENCES agents(id),
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
-CREATE INDEX IF NOT EXISTS idx_runs_work_item ON runs(work_item_id, status);
-CREATE INDEX IF NOT EXISTS idx_runs_agent ON runs(agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_runs_work_status ON runs(work_item_id, status);
+CREATE INDEX IF NOT EXISTS idx_runs_agent_status ON runs(agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_runs_lease ON runs(lease_expires_at) WHERE status IN ('offered','claimed','running');
 
 -- ── Checkpoints: cross-session recovery snapshots ────────────────
@@ -143,20 +137,19 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     run_id          TEXT NOT NULL,
     version         INTEGER NOT NULL DEFAULT 1,
     snapshot_json   TEXT NOT NULL,
-    -- structured: completed_steps, decisions, repo_state, changed_files, tests, risks, next_steps, artifacts
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (run_id) REFERENCES runs(id)
 );
 CREATE INDEX IF NOT EXISTS idx_checkpoints_run ON checkpoints(run_id, version);
 
--- ── Artifacts: deliverable references with integrity ────────────
+-- ── Artifacts ────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS artifacts (
     id              TEXT PRIMARY KEY,
     run_id          TEXT,
     work_item_id    TEXT NOT NULL,
     task_id         TEXT NOT NULL,
-    kind            TEXT NOT NULL,  -- file|commit|report|doc|log
-    ref             TEXT NOT NULL,  -- path|sha|url
+    kind            TEXT NOT NULL,
+    ref             TEXT NOT NULL,
     hash            TEXT,
     metadata_json   TEXT NOT NULL DEFAULT '{}',
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -165,9 +158,10 @@ CREATE TABLE IF NOT EXISTS artifacts (
     FOREIGN KEY (task_id) REFERENCES tasks(id)
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
-CREATE INDEX IF NOT EXISTS idx_artifacts_work_item ON artifacts(work_item_id);
 
 -- ── Events: immutable append-only fact log ───────────────────────
+-- No FK constraints: events may reference tasks/work_items during creation
+-- before the full transaction commits. Integrity is enforced by the service layer.
 CREATE TABLE IF NOT EXISTS events (
     event_id            INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id             TEXT NOT NULL,
@@ -187,9 +181,9 @@ CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type, created_at);
 CREATE TABLE IF NOT EXISTS deliveries (
     id              TEXT PRIMARY KEY,
     event_id        INTEGER NOT NULL,
-    recipient_kind  TEXT NOT NULL,  -- session|run|agent|adapter
+    recipient_kind  TEXT NOT NULL,
     recipient_id    TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'pending', -- pending|acked|expired
+    status          TEXT NOT NULL DEFAULT 'pending',
     attempt_count   INTEGER NOT NULL DEFAULT 0,
     available_at    TEXT NOT NULL DEFAULT (datetime('now')),
     lease_expires_at TEXT,
@@ -203,9 +197,9 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_pending ON deliveries(status, availabl
 -- ── Outbox: reliable adapter dispatch ────────────────────────────
 CREATE TABLE IF NOT EXISTS outbox (
     id              TEXT PRIMARY KEY,
-    event_type      TEXT NOT NULL,      -- adapter.dispatch|adapter.cancel
+    event_type      TEXT NOT NULL,
     payload_json    TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'pending', -- pending|delivered|failed|dead_letter
+    status          TEXT NOT NULL DEFAULT 'pending',
     attempts        INTEGER NOT NULL DEFAULT 0,
     max_attempts    INTEGER NOT NULL DEFAULT 5,
     retry_at        TEXT,
@@ -214,15 +208,15 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status, retry_at) WHERE status='pending';
 
--- ── Approvals: policy-gate human-in-the-loop ─────────────────────
+-- ── Approvals ────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS approvals (
     id              TEXT PRIMARY KEY,
     task_id         TEXT NOT NULL,
     work_item_id    TEXT,
     run_id          TEXT,
-    action          TEXT NOT NULL,      -- deploy|external_msg|pr|budget_increase|scope_change|conflict
+    action          TEXT NOT NULL,
     reason          TEXT NOT NULL DEFAULT '',
-    decision        TEXT,               -- NULL=pending|approved|rejected
+    decision        TEXT,
     decided_by      TEXT,
     decided_at      TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -232,12 +226,12 @@ CREATE TABLE IF NOT EXISTS approvals (
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_pending ON approvals(task_id) WHERE decision IS NULL;
 
--- ── Resource locks: fencing-aware shared resource control ────────
+-- ── Resource locks: fencing-aware (no FK to runs, holder may be coordinator) ─
 CREATE TABLE IF NOT EXISTS resource_locks (
     id              TEXT PRIMARY KEY,
     lock_key        TEXT NOT NULL UNIQUE,
     holder_run_id   TEXT NOT NULL,
-    resource_type   TEXT NOT NULL DEFAULT 'general', -- branch|file_group|server|general
+    resource_type   TEXT NOT NULL DEFAULT 'general',
     resource_id     TEXT NOT NULL DEFAULT '',
     fencing_token   INTEGER NOT NULL,
     expires_at      TEXT NOT NULL,
@@ -245,5 +239,3 @@ CREATE TABLE IF NOT EXISTS resource_locks (
 );
 CREATE INDEX IF NOT EXISTS idx_locks_key ON resource_locks(lock_key);
 CREATE INDEX IF NOT EXISTS idx_locks_expires ON resource_locks(expires_at);
-
-INSERT OR IGNORE INTO schema_migrations (version, filename) VALUES (2, '002_task_runtime_v2.sql');

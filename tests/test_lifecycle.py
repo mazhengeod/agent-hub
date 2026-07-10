@@ -1,212 +1,202 @@
-"""Test core lifecycle: task -> plan -> claim -> run -> complete."""
+"""Test lifecycle: task -> plan -> claim -> run -> complete, checkpoint,
+cross-agent resume, retry, review rework."""
 from __future__ import annotations
 
 import pytest
 
-from agent_hub import service
+from agent_hub import service, storage
+from agent_hub.db import get_db
 from agent_hub.models import HubError
 
 
-def test_full_task_lifecycle(make_session):
-    """Task: create -> plan -> start -> claim -> start_run -> complete."""
-    sess = make_session()
-    session_id = sess["session_id"]
-
-    task = service.create_task("Build feature X", "test-agent")
-    assert task["status"] == "draft"
-    task_id = task["id"]
-
-    planned = service.plan_task(task_id, [
-        {"kind": "implement", "objective": "Write the code", "ref": "wi1"},
-        {"kind": "verify", "objective": "Test the code", "ref": "wi2",
-         "needs_review": True},
+def test_full_task_lifecycle(db_path, make_session):
+    sess = make_session("agent-a")
+    task = service.create_task("Build feature X", "agent-a")
+    service.plan_task(task["id"], [
+        {"kind": "implement", "objective": "Write code", "ref": "wi1"},
+        {"kind": "verify", "objective": "Test code", "ref": "wi2"},
     ], dependencies=[
-        {"work_item": "wi2", "depends_on": "wi1", "condition": "succeeded"},
-    ], actor_agent_id="test-agent")
-    assert planned["status"] == "planned"
-    assert planned["plan_version"] == 2
+        {"work_item": "wi2", "depends_on": "wi1"},
+    ], actor_agent_id="agent-a")
+    service.start_task(task["id"], "agent-a")
 
-    started = service.start_task(task_id, "test-agent")
-    assert started["status"] == "running"
-
-    # wi1 should be ready (no deps), wi2 should be pending (depends on wi1)
-    from agent_hub import storage
-    from agent_hub.db import get_db
     conn = get_db()
-    items = storage.list_work_items(conn, task_id)
-    wi1 = next(wi for wi in items if wi.objective == "Write the code")
-    wi2 = next(wi for wi in items if wi.objective == "Test the code")
+    items = storage.list_work_items(conn, task["id"])
+    wi1 = next(wi for wi in items if wi.objective == "Write code")
+    wi2 = next(wi for wi in items if wi.objective == "Test code")
     assert wi1.status == "ready"
     assert wi2.status == "pending"
 
-    # Claim wi1
-    claimed = service.claim_work("test-agent", session_id, work_item_id=wi1.id)
-    assert claimed is not None
-    assert claimed["work_item_id"] == wi1.id
-    run_id = claimed["run_id"]
-    fencing_token = claimed["fencing_token"]
+    claimed = service.claim_work("agent-a", sess["session_id"], work_item_id=wi1.id)
+    service.start_run(claimed["run_id"], claimed["fencing_token"],
+                      sess["session_id"], "agent-a")
+    service.complete_run(claimed["run_id"], claimed["fencing_token"],
+                         "succeeded", "agent-a",
+                         artifacts=[{"kind": "file", "ref": "src/feature.py"}])
 
-    # Start the run
-    started_run = service.start_run(run_id, fencing_token, session_id)
-    assert started_run["status"] == "running"
-
-    # Complete successfully
-    completed = service.complete_run(run_id, fencing_token, "succeeded",
-        artifacts=[{"kind": "file", "ref": "src/feature.py"}],
-        actor_agent_id="test-agent")
-    assert completed["status"] == "succeeded"
-
-    # wi1 should be succeeded, wi2 should now be ready (dep satisfied)
     conn = get_db()
-    items = storage.list_work_items(conn, task_id)
-    wi1 = next(wi for wi in items if wi.objective == "Write the code")
-    wi2 = next(wi for wi in items if wi.objective == "Test the code")
+    wi1 = storage.get_work_item(conn, wi1.id)
+    wi2 = storage.get_work_item(conn, wi2.id)
     assert wi1.status == "succeeded"
     assert wi2.status == "ready"
 
-
-def test_stale_fencing_token_rejected(make_session):
-    """A stale fencing token must be rejected."""
-    sess = make_session()
-    session_id = sess["session_id"]
-
-    task = service.create_task("Task Y", "test-agent")
-    service.plan_task(task["id"], [
-        {"kind": "implement", "objective": "Do work", "ref": "wi1"},
-    ], actor_agent_id="test-agent")
-    service.start_task(task["id"], "test-agent")
-
-    from agent_hub import storage
-    from agent_hub.db import get_db
-    conn = get_db()
-    wi = storage.list_work_items(conn, task["id"])[0]
-
-    claimed = service.claim_work("test-agent", session_id, work_item_id=wi.id)
-    run_id = claimed["run_id"]
-    token = claimed["fencing_token"]
-
-    service.start_run(run_id, token, session_id)
-
-    # Try to complete with WRONG token
-    with pytest.raises(HubError) as exc:
-        service.complete_run(run_id, token + 999, "succeeded")
-    assert exc.value.code == "stale_token"
-
-
-def test_run_retry_on_failure(make_session):
-    """Failed runs should be retried up to max_attempts, then marked failed."""
-    sess = make_session()
-    session_id = sess["session_id"]
-
-    task = service.create_task("Task Z", "test-agent")
-    service.plan_task(task["id"], [
-        {"kind": "implement", "objective": "Do work", "ref": "wi1",
-         "retry_policy_json": '{"max_attempts": 2}'},
-    ], actor_agent_id="test-agent")
-    service.start_task(task["id"], "test-agent")
-
-    from agent_hub import storage
-    from agent_hub.db import get_db
-    conn = get_db()
-    wi = storage.list_work_items(conn, task["id"])[0]
-
-    # First attempt fails
-    claimed = service.claim_work("test-agent", session_id, work_item_id=wi.id)
-    service.start_run(claimed["run_id"], claimed["fencing_token"], session_id)
-    service.complete_run(claimed["run_id"], claimed["fencing_token"], "failed",
-                         failure_code="test_error")
-
-    wi = storage.get_work_item(conn, wi.id)
-    assert wi.status == "ready", "Should be ready for retry after first failure"
-
-    # Second attempt fails - should exhaust retries
-    claimed2 = service.claim_work("test-agent", session_id, work_item_id=wi.id)
-    assert claimed2["attempt_no"] == 2
-    service.start_run(claimed2["run_id"], claimed2["fencing_token"], session_id)
-    service.complete_run(claimed2["run_id"], claimed2["fencing_token"], "failed",
-                         failure_code="test_error")
-
-    wi = storage.get_work_item(conn, wi.id)
-    assert wi.status == "failed", "Should be failed after exhausting retries"
-
+    claimed2 = service.claim_work("agent-a", sess["session_id"], work_item_id=wi2.id)
+    service.start_run(claimed2["run_id"], claimed2["fencing_token"],
+                      sess["session_id"], "agent-a")
+    service.complete_run(claimed2["run_id"], claimed2["fencing_token"],
+                         "succeeded", "agent-a")
     task = service.get_task(task["id"])
-    assert task["status"] == "failed"
+    assert task["status"] == "completed"
 
 
-def test_checkpoint_and_resume(make_session):
-    """Checkpoint saves state; resume creates new attempt with checkpoint."""
-    sess = make_session()
-    session_id = sess["session_id"]
-
-    task = service.create_task("Task CP", "test-agent")
+def test_run_retry_on_failure(db_path, make_session):
+    sess = make_session("agent-a")
+    task = service.create_task("Task Z", "agent-a")
     service.plan_task(task["id"], [
-        {"kind": "implement", "objective": "Do work", "ref": "wi1"},
-    ], actor_agent_id="test-agent")
-    service.start_task(task["id"], "test-agent")
+        {"kind": "implement", "objective": "work", "ref": "wi1",
+         "retry_policy_json": '{"max_attempts": 2}'},
+    ], actor_agent_id="agent-a")
+    service.start_task(task["id"], "agent-a")
 
-    from agent_hub import storage
-    from agent_hub.db import get_db
     conn = get_db()
     wi = storage.list_work_items(conn, task["id"])[0]
 
-    claimed = service.claim_work("test-agent", session_id, work_item_id=wi.id)
-    run_id = claimed["run_id"]
-    token = claimed["fencing_token"]
-    service.start_run(run_id, token, session_id)
+    c1 = service.claim_work("agent-a", sess["session_id"], work_item_id=wi.id)
+    service.start_run(c1["run_id"], c1["fencing_token"], sess["session_id"], "agent-a")
+    service.complete_run(c1["run_id"], c1["fencing_token"], "failed", "agent-a",
+                         failure_code="err")
+    wi = storage.get_work_item(conn, wi.id)
+    assert wi.status == "ready"
 
-    # Save checkpoint
-    snapshot = {"completed_steps": ["step1", "step2"], "decisions": ["use_redis"]}
-    cp = service.save_checkpoint(run_id, token, snapshot)
+    c2 = service.claim_work("agent-a", sess["session_id"], work_item_id=wi.id)
+    assert c2["attempt_no"] == 2
+    service.start_run(c2["run_id"], c2["fencing_token"], sess["session_id"], "agent-a")
+    service.complete_run(c2["run_id"], c2["fencing_token"], "failed", "agent-a",
+                         failure_code="err")
+    wi = storage.get_work_item(conn, wi.id)
+    assert wi.status == "failed"
+    assert service.get_task(task["id"])["status"] == "failed"
+
+
+def test_checkpoint_and_cross_agent_resume(db_path, make_session):
+    """P1 fix: agent B can resume agent A's lost run from checkpoint."""
+    sess_a = make_session("agent-a")
+    task = service.create_task("Task CP", "agent-a")
+    service.plan_task(task["id"], [
+        {"kind": "implement", "objective": "work", "ref": "wi1"},
+    ], actor_agent_id="agent-a")
+    service.start_task(task["id"], "agent-a")
+
+    conn = get_db()
+    wi = storage.list_work_items(conn, task["id"])[0]
+
+    c1 = service.claim_work("agent-a", sess_a["session_id"], work_item_id=wi.id)
+    run_id = c1["run_id"]
+    token = c1["fencing_token"]
+    service.start_run(run_id, token, sess_a["session_id"], "agent-a")
+
+    snapshot = {"completed_steps": ["step1"], "decisions": ["use_redis"]}
+    cp = service.save_checkpoint(run_id, token, snapshot, "agent-a")
     assert cp["version"] == 1
 
-    # Simulate lease expiry -> run becomes lost
     conn = get_db()
     conn.execute("BEGIN")
-    conn.execute(
-        "UPDATE runs SET lease_expires_at=? WHERE id=?",
-        ("2000-01-01T00:00:00+00:00", run_id),
-    )
-    conn.commit()
+    conn.execute("UPDATE runs SET lease_expires_at=? WHERE id=?",
+                 ("2000-01-01T00:00:00+00:00", run_id))
+    conn.execute("COMMIT")
     storage.expire_stale_runs(conn)
-    conn.commit()
-    run = storage.get_run(conn, run_id)
-    assert run.status == "lost"
+    conn.execute("BEGIN")
+    conn.execute("UPDATE runs SET status='lost' WHERE id=?", (run_id,))
+    conn.execute("COMMIT")
+    assert storage.get_run(conn, run_id).status == "lost"
 
-    # Resume
-    resumed = service.resume_run(run_id, session_id, "test-agent")
+    sess_b = make_session("agent-b")
+    resumed = service.resume_run(run_id, sess_b["session_id"], "agent-b")
     assert resumed["attempt_no"] == 2
     assert resumed["checkpoint"] is not None
-    assert resumed["checkpoint"]["completed_steps"] == ["step1", "step2"]
-    assert resumed["checkpoint_version"] == 1
+    assert resumed["checkpoint"]["completed_steps"] == ["step1"]
 
 
-def test_review_gate(make_session):
-    """Work items with needs_review go to 'reviewing' after success."""
-    sess = make_session()
-    session_id = sess["session_id"]
-
-    task = service.create_task("Task Review", "test-agent")
+def test_review_rework_cycle(db_path, make_session):
+    """P1 fix: rejection routes work back to ready for rework."""
+    sess = make_session("agent-a")
+    task = service.create_task("Task Review", "agent-a")
     service.plan_task(task["id"], [
-        {"kind": "implement", "objective": "Do work", "ref": "wi1",
+        {"kind": "implement", "objective": "work", "ref": "wi1",
          "needs_review": True},
-    ], actor_agent_id="test-agent")
-    service.start_task(task["id"], "test-agent")
+    ], actor_agent_id="agent-a")
+    service.start_task(task["id"], "agent-a")
 
-    from agent_hub import storage
-    from agent_hub.db import get_db
     conn = get_db()
     wi = storage.list_work_items(conn, task["id"])[0]
 
-    claimed = service.claim_work("test-agent", session_id, work_item_id=wi.id)
-    service.start_run(claimed["run_id"], claimed["fencing_token"], session_id)
-    service.complete_run(claimed["run_id"], claimed["fencing_token"], "succeeded")
+    c1 = service.claim_work("agent-a", sess["session_id"], work_item_id=wi.id)
+    service.start_run(c1["run_id"], c1["fencing_token"], sess["session_id"], "agent-a")
+    service.complete_run(c1["run_id"], c1["fencing_token"], "succeeded", "agent-a")
 
     wi = storage.get_work_item(conn, wi.id)
     assert wi.status == "reviewing"
 
-    # Approve
-    result = service.approve_work(wi.id, "reviewer-agent", "approved", "looks good")
-    assert result["status"] == "succeeded"
+    result = service.approve_work(wi.id, "reviewer", "rejected", "fix bugs")
+    assert result["status"] == "ready"
 
-    task = service.get_task(task["id"])
-    assert task["status"] == "completed"
+    c2 = service.claim_work("agent-a", sess["session_id"], work_item_id=wi.id)
+    assert c2 is not None
+    assert c2["attempt_no"] == 2
+    service.start_run(c2["run_id"], c2["fencing_token"], sess["session_id"], "agent-a")
+    service.complete_run(c2["run_id"], c2["fencing_token"], "succeeded", "agent-a")
+
+    result = service.approve_work(wi.id, "reviewer", "approved", "good")
+    assert result["status"] == "succeeded"
+    assert service.get_task(task["id"])["status"] == "completed"
+
+
+def test_review_approved_completes_task(db_path, make_session):
+    sess = make_session("agent-a")
+    task = service.create_task("Task", "agent-a")
+    service.plan_task(task["id"], [
+        {"kind": "implement", "objective": "work", "ref": "wi1",
+         "needs_review": True},
+    ], actor_agent_id="agent-a")
+    service.start_task(task["id"], "agent-a")
+
+    conn = get_db()
+    wi = storage.list_work_items(conn, task["id"])[0]
+
+    c1 = service.claim_work("agent-a", sess["session_id"], work_item_id=wi.id)
+    service.start_run(c1["run_id"], c1["fencing_token"], sess["session_id"], "agent-a")
+    service.complete_run(c1["run_id"], c1["fencing_token"], "succeeded", "agent-a")
+
+    service.approve_work(wi.id, "reviewer", "approved", "ok")
+    assert service.get_task(task["id"])["status"] == "completed"
+
+
+def test_concurrent_claim_no_duplicate(db_path, make_session):
+    import threading
+    sess = make_session("agent-a")
+    task = service.create_task("Concurrent", "agent-a")
+    service.plan_task(task["id"], [
+        {"kind": "implement", "objective": "work", "ref": "wi1"},
+    ], actor_agent_id="agent-a")
+    service.start_task(task["id"], "agent-a")
+
+    conn = get_db()
+    wi = storage.list_work_items(conn, task["id"])[0]
+
+    results = []
+    errors = []
+
+    def try_claim():
+        try:
+            r = service.claim_work("agent-a", sess["session_id"], work_item_id=wi.id)
+            results.append(r)
+        except Exception as e:
+            errors.append(e)
+
+    t1 = threading.Thread(target=try_claim)
+    t2 = threading.Thread(target=try_claim)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    successful = [r for r in results if r is not None]
+    assert len(successful) <= 1

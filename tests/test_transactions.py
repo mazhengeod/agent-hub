@@ -1,78 +1,65 @@
-"""Test transaction boundary: storage functions never commit,
-UnitOfWork owns begin/commit/rollback."""
+"""Test transaction boundary: storage never commits, UoW owns transactions."""
 from __future__ import annotations
 
 import sqlite3
 import pytest
 
-from agent_hub import db, storage, service
-from agent_hub.db import UnitOfWork, WriteExecutor, write_executor
+from agent_hub import db, storage
+from agent_hub.db import UnitOfWork, WriteExecutor
 from agent_hub.models import HubError
 
 
-def test_storage_never_commits(temp_db):
-    """If a storage write is not wrapped in UoW, it should not persist.
-    With isolation_level=None, we must manually BEGIN to test this."""
-    conn = db.get_db(temp_db)
+def test_storage_never_commits(db_path):
+    conn = db.get_db(db_path)
     conn.execute("BEGIN")
-    storage.create_task(conn, "test-task-1", "test objective", "test-agent")
-    conn.rollback()
-    task = storage.get_task(conn, "test-task-1")
-    assert task is None, "storage.create_task should not have persisted after rollback"
+    storage.create_task(conn, "t1", "obj", "agent-a")
+    conn.execute("ROLLBACK")
+    assert storage.get_task(conn, "t1") is None
 
 
-def test_uow_commits_on_success(temp_db):
-    conn = db.get_db(temp_db)
+def test_uow_commits_on_success(db_path):
+    conn = db.get_db(db_path)
     with UnitOfWork(conn):
-        storage.create_task(conn, "test-task-2", "test objective", "test-agent")
-    task = storage.get_task(conn, "test-task-2")
-    assert task is not None
-    assert task.objective == "test objective"
+        storage.create_task(conn, "t1", "obj", "agent-a")
+    assert storage.get_task(conn, "t1") is not None
 
 
-def test_uow_rolls_back_on_exception(temp_db):
-    conn = db.get_db(temp_db)
+def test_uow_rolls_back_on_exception(db_path):
+    conn = db.get_db(db_path)
     with pytest.raises(RuntimeError):
         with UnitOfWork(conn):
-            storage.create_task(conn, "test-task-3", "test objective", "test-agent")
-            raise RuntimeError("simulated failure")
-    task = storage.get_task(conn, "test-task-3")
-    assert task is None, "Task should not persist after exception in UoW"
+            storage.create_task(conn, "t1", "obj", "agent-a")
+            raise RuntimeError("fail")
+    assert storage.get_task(conn, "t1") is None
 
 
-def test_event_and_state_same_transaction(temp_db):
-    """Event and business state must be in the same transaction."""
-    conn = db.get_db(temp_db)
+def test_event_and_state_same_transaction(db_path):
+    conn = db.get_db(db_path)
     executor = WriteExecutor()
 
     def _write(c):
-        storage.create_task(c, "test-task-4", "test objective", "test-agent")
-        storage.append_event(c, "test-task-4", "task.created",
-                             actor_agent_id="test-agent")
+        storage.create_task(c, "t1", "obj", "agent-a")
+        storage.append_event(c, "t1", "task.created", actor_agent_id="agent-a")
         return None
 
     executor.execute_write(conn, _write)
-    task = storage.get_task(conn, "test-task-4")
-    events = conn.execute("SELECT * FROM events WHERE task_id=?", ("test-task-4",)).fetchall()
-    assert task is not None
+    assert storage.get_task(conn, "t1") is not None
+    events = conn.execute("SELECT * FROM events WHERE task_id='t1'").fetchall()
     assert len(events) == 1
 
 
-def test_write_executor_retries_on_busy(temp_db):
-    """WriteExecutor should retry on SQLITE_BUSY."""
-    conn = db.get_db(temp_db)
-    call_count = {"n": 0}
+def test_write_executor_retries_on_busy(db_path):
+    conn = db.get_db(db_path)
+    calls = {"n": 0}
 
     def _write(c):
-        call_count["n"] += 1
-        if call_count["n"] < 2:
+        calls["n"] += 1
+        if calls["n"] < 2:
             raise sqlite3.OperationalError("database is locked")
-        storage.create_task(c, "test-task-5", "test objective", "test-agent")
+        storage.create_task(c, "t1", "obj", "agent-a")
         return None
 
     executor = WriteExecutor()
-    result = executor.execute_write(conn, _write, max_retries=3)
-    assert result is None
-    assert call_count["n"] == 2, "Should have retried once"
-    task = storage.get_task(conn, "test-task-5")
-    assert task is not None
+    executor.execute_write(conn, _write, max_retries=3)
+    assert calls["n"] == 2
+    assert storage.get_task(conn, "t1") is not None
