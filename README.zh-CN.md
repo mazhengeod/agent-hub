@@ -119,9 +119,11 @@ cp config.example.yaml ~/.config/agent-hub/config.yaml
 创建 `~/.config/agent-hub/agents.env`，每个 Agent 一行：
 
 ```env
+codex=your-codex-token
+trae=your-trae-token
+claude=your-claude-token
 hermes=your-hermes-token
-codex-desktop=your-codex-token
-trae-solo=your-trae-token
+opencode=your-opencode-token
 ```
 
 > **安全须知**：Token 仅从 HTTP `Authorization: Bearer ...` header 读取，绝不作为 MCP 工具参数暴露。
@@ -310,7 +312,7 @@ max_work_depth: 6                   # DAG 最大深度
 max_simultaneous_runs_per_agent: 4  # 单 Agent 最大并发 Run
 
 operator_agent_ids:                 # 可决定审批的 Agent
-  - codex-desktop
+  - codex
 ```
 
 ### 诊断技巧

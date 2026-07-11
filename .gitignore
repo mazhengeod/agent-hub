@@ -10,3 +10,8 @@ build/
 *.db
 *.db-shm
 *.db-wal
+
+# Local-only secrets and runtime config. Do not commit real Agent Hub tokens.
+.agent-hub-local/
+agents.env
+*.env

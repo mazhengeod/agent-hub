@@ -15,5 +15,4 @@ max_simultaneous_runs_per_agent: 4
 # Only these authenticated MCP agent IDs may resolve approvals.
 # Local `hubctl approve|reject` is always treated as the human operator path.
 operator_agent_ids:
-  - codex-desktop
-
+  - codex

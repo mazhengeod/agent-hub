@@ -13,22 +13,39 @@
 | 认证方式 | `Authorization: Bearer <your_token>` |
 | Token 存储 | `~/.config/agent-hub/agents.env`（格式：`agent_id=token`） |
 
+本地预置 5 个 Agent 身份：
+
+- `codex`
+- `trae`
+- `claude`
+- `hermes`
+- `opencode`
+
+首次接入不会自动签发 token。服务端必须先写好 `agents.env`，Agent 才能用对应 token 调用 `session_start` 自动创建数据库里的 Agent 记录。
+
 ---
 
 ## 2. 三步握手（每次连接）
 
 ```python
-# Step 1: GET /mcp → 获取 session ID
-r = httpx.get("http://127.0.0.1:8765/mcp", headers={"Authorization": f"Bearer {T}"})
+# Step 1: POST initialize → 获取 MCP session ID
+r = httpx.post("http://127.0.0.1:8765/mcp", headers={
+    "Authorization": f"Bearer {T}",
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+}, json={
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "hermes", "version": "1.0"}
+    }
+})
 session_id = r.headers["mcp-session-id"]
 
-# Step 2: initialize
-mcp_call("initialize", {
-    "protocolVersion": "2024-11-05",
-    "capabilities": {},
-    "clientInfo": {"name": "hermes", "version": "1.0"}
-})
-
+# Step 2: 后续 tools/call 请求都带上 mcp-session-id
 # Step 3: 开始调用工具
 ```
 
@@ -46,7 +63,7 @@ session_start({capabilities: ["code_review", "deployment"]})
 ```json
 {
   "session_id": "abc123",
-  "agent": {"id": "hermes-agent", "name": "Hermes Agent"},
+  "agent": {"id": "hermes", "name": "hermes"},
   "bootstrap": {
     "tasks": [],        // 你参与的活跃任务
     "offers": [],       // 调度器分配给你的工作
@@ -247,6 +264,7 @@ import json, os, httpx
 
 HOME = os.path.expanduser("~")
 BASE = "http://127.0.0.1:8765/mcp"
+AGENT_ID = os.environ.get("AGENT_HUB_AGENT_ID", "hermes")
 
 # 读取 token
 tokens = {}
@@ -257,23 +275,39 @@ with open(f"{HOME}/.config/agent-hub/agents.env") as f:
             k, v = line.split("=", 1)
             tokens[k.strip()] = v.strip()
 
-T = tokens["hermes-agent"]
-headers = {"Authorization": f"Bearer {T}", "Accept": "application/json, text/event-stream"}
+T = tokens[AGENT_ID]
+base_headers = {
+    "Authorization": f"Bearer {T}",
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+}
 
-# Step 1: GET session
-r = httpx.get(BASE, headers=headers, timeout=5)
-sid = r.headers["mcp-session-id"]
-
-ch = {"Authorization": f"Bearer {T}", "Content-Type": "application/json",
-      "Accept": "application/json, text/event-stream", "mcp-session-id": sid}
-
-def mcp_call(method, params=None):
-    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
-    with httpx.stream("POST", BASE, json=body, headers=ch, timeout=15) as resp:
-        for line in resp.iter_lines():
-            if line.startswith("data:"):
-                return json.loads(line[5:])
+def read_sse_json(resp):
+    for line in resp.iter_lines():
+        if line.startswith("data:"):
+            return json.loads(line[5:])
     return None
+
+def raw_mcp_call(method, params=None, headers=None, request_id=1):
+    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
+    body["id"] = request_id
+    with httpx.stream("POST", BASE, json=body, headers=headers or base_headers, timeout=15) as resp:
+        return resp, read_sse_json(resp)
+
+# Step 1: initialize，同时从响应头获取 MCP session id
+resp, init_result = raw_mcp_call("initialize", {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {},
+    "clientInfo": {"name": AGENT_ID, "version": "1.0"}
+}, request_id=1)
+
+sid = resp.headers["mcp-session-id"]
+session_headers = dict(base_headers)
+session_headers["mcp-session-id"] = sid
+
+def mcp_call(method, params=None, request_id=2):
+    _, data = raw_mcp_call(method, params, headers=session_headers, request_id=request_id)
+    return data
 
 def tool(name, args=None):
     r = mcp_call("tools/call", {"name": name, "arguments": args or {}})
@@ -281,23 +315,16 @@ def tool(name, args=None):
         return json.loads(r["result"]["content"][0]["text"])
     return r
 
-# Initialize
-mcp_call("initialize", {
-    "protocolVersion": "2024-11-05",
-    "capabilities": {},
-    "clientInfo": {"name": "hermes", "version": "1.0"}
-})
-
 # Bootstrap
-bootstrap = json.loads(tool("session_start", {
+bootstrap = tool("session_start", {
     "capabilities": ["code_review", "deployment"]
-}))
+})
 
 session_id = bootstrap["session_id"]
 print(f"Connected: {session_id}")
 
 # Sync
-sync = json.loads(tool("agent_sync", {"session_id": session_id}))
+sync = tool("agent_sync", {"session_id": session_id})
 print(f"Ready work: {len(sync.get('ready_work',[]))}")
 print(f"Deliveries: {len(sync.get('deliveries',[]))}")
 ```
