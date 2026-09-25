@@ -4,9 +4,9 @@
 
 ### Task-driven control plane for multi-agent work
 
-[![version](https://img.shields.io/badge/version-0.5.0-4B3FE3)](pyproject.toml)
+[![version](https://img.shields.io/badge/version-0.6.0-4B3FE3)](pyproject.toml)
 [![python](https://img.shields.io/badge/python-3.11+-3776AB)](pyproject.toml)
-[![tests](https://img.shields.io/badge/tests-67%20passed-1DC981)](#verification)
+[![tests](https://img.shields.io/badge/tests-pytest-1DC981)](#verification)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **English** | [中文](README.zh-CN.md)
@@ -36,8 +36,8 @@ Agent Hub is a task-driven control plane for multi-agent work. A durable `Task`
 owns the goal and policy, `WorkItem` nodes form a DAG, and every execution is a
 leased, fenced `Run` bound to a short-lived agent `Session`.
 
-The v0.5 model is intentionally clean-slate. It does not read or migrate the old
-round/message/assignment schema.
+The v0.6 line upgrades v0.5 databases in place with checksummed migrations.
+Pre-v0.5 round/message/assignment databases remain unsupported.
 
 ### What is implemented
 
@@ -98,26 +98,27 @@ Task (sole aggregate root)
 ### 1. Install (WSL)
 
 ```bash
-cd ~/agent-hub
 python3 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
+.venv/bin/pip install agent-hub-mcp
 mkdir -p ~/.config/agent-hub
-cp config.example.yaml ~/.config/agent-hub/config.yaml
+cp /path/to/config.example.yaml ~/.config/agent-hub/config.yaml
 ```
 
 Create `~/.config/agent-hub/agents.env` with one `agent_id=token` entry per
 agent. Tokens are read only from the HTTP `Authorization: Bearer ...` header;
 they are never MCP tool arguments.
 
-### 2. First start (clean old data)
+### 2. Back up and start
 
-v0.5 has no legacy compatibility. Remove any pre-v0.5 database before first start:
+Never delete the database to upgrade. Back it up with SQLite's online backup API,
+verify it, then restart the service:
 
 ```bash
-systemctl --user stop agent-hub.service
-rm -f ~/.local/share/agent-hub/hub.db*
+hubctl doctor
+hubctl backup
 systemctl --user daemon-reload
 systemctl --user enable --now agent-hub.service
+hubctl doctor
 ```
 
 There is only one service. The scheduler runs inside the FastMCP lifespan so all
@@ -132,14 +133,15 @@ writers share the same process-local write gate.
 5. Save checkpoints at meaningful boundaries.
 6. Complete, block, or request approval; do not leave a Run silently hanging.
 
-`since_event_id` is only an ordering hint. Unacknowledged deliveries are always
-redelivered until `delivery_ack`, preventing cursor advancement from losing work.
+`agent_sync` marks deliveries as observed and advances an observation cursor; it
+does not acknowledge them. Unacknowledged deliveries are redelivered until
+`delivery_ack` or `delivery_ack_batch` succeeds.
 
 ---
 
 ## MCP Tools
 
-37 MCP tools, grouped by function:
+38 MCP tools, grouped by function:
 
 ### Session
 
@@ -200,6 +202,7 @@ redelivered until `delivery_ack`, preventing cursor advancement from losing work
 |---|---|
 | `agent_sync` | Batch pull: heartbeat + ready work + cursor deliveries + active runs |
 | `delivery_ack` | Ack delivery (non-destructive, per-recipient) |
+| `delivery_ack_batch` | Atomically ack a bounded batch of deliveries |
 | `event_post` | Post event (idempotent) |
 
 ### Adapter
@@ -251,6 +254,9 @@ shell command.
 
 ```bash
 hubctl status              # show hub diagnostics
+hubctl status --json       # machine-readable diagnostics
+hubctl doctor              # strictly read-only DB/config/permission checks
+hubctl backup              # online SQLite backup plus SHA256 sidecar
 hubctl tasks               # list tasks
 hubctl tasks running       # filter by status
 hubctl task <task-id>      # show task detail with work items and runs
@@ -322,12 +328,15 @@ State change
 ```bash
 .venv/bin/python -m pytest -q
 .venv/bin/python -m compileall -q src tests
+python -m build
 ```
 
-The test suite (67 tests, all passing) covers transactions, migrations, security
-ownership, genuine multi-connection claims, DAG transitions, cross-agent
-recovery, review/rework, delivery/outbox recovery, coordinator leases, dynamic
-work, approvals, adapters, blocking and cancellation.
+The suite covers transactions, migrations, validation and security ownership,
+multi-connection claims, DAG transitions, recovery, review/rework, delivery and
+outbox semantics, operations, coordinator leases, approvals and adapters. CI also
+installs the built wheel into a clean environment and verifies packaged migrations.
+
+See [Upgrade and rollback](docs/upgrade-and-rollback.md) before a production cutover.
 
 ---
 

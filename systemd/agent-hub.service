@@ -1,16 +1,31 @@
 [Unit]
-Description=Agent Hub MCP Server (v0.5.0)
+Description=Agent Hub MCP Server (v0.6.0)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=mazhengeod
-WorkingDirectory=/home/mazhengeod/agent-hub
-ExecStart=/home/mazhengeod/agent-hub/.venv/bin/python -m agent_hub.server
+WorkingDirectory=%h/agent-hub
+ExecStart=%h/agent-hub/.venv/bin/python -m agent_hub.server
 Restart=on-failure
 RestartSec=5
+UMask=0077
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=%h/agent-hub %h/.config/agent-hub
+ReadWritePaths=%h/.local/share/agent-hub
 
 [Install]
 WantedBy=default.target

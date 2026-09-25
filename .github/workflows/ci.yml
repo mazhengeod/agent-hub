@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install development dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Build distributions
+        run: python -m build
+      - name: Verify wheel contents and clean install
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          python -m zipfile -l "$wheel" | grep 'agent_hub/migrations/001_init_v2.sql'
+          python -m zipfile -l "$wheel" | grep 'agent_hub/migrations/002_operational_hardening.sql'
+          python -m venv /tmp/agent-hub-wheel-test
+          /tmp/agent-hub-wheel-test/bin/pip install "$wheel"
+          test_home=$(mktemp -d)
+          HOME="$test_home" /tmp/agent-hub-wheel-test/bin/python - <<'PY'
+          from agent_hub import __version__
+          from agent_hub.db import init_db, get_applied_migrations
+
+          connection = init_db()
+          versions = [item["version"] for item in get_applied_migrations(connection)]
+          assert __version__ == "0.6.0"
+          assert versions == [1, 2]
+          expected = {"tasks", "work_items", "runs", "deliveries", "consumer_cursors"}
+          actual = {
+              row[0]
+              for row in connection.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table'"
+              )
+          }
+          assert expected <= actual
+          PY

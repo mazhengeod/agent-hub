@@ -10,8 +10,59 @@ Event is an immutable fact; Delivery is per-recipient state.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
-from pydantic import BaseModel, Field
+import json
+from typing import Any, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class WorkItemSpec(BaseModel):
+    """Validated public input for task planning and child work creation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["plan", "research", "implement", "review", "verify", "operate", "summarize"]
+    objective: str = Field(min_length=1, max_length=20_000)
+    ref: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    parent_id: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    acceptance: list[Any] = Field(default_factory=list, max_length=200)
+    required_capabilities: list[str] = Field(default_factory=list, max_length=100)
+    preferred_agent_id: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    priority: int = Field(default=0, ge=-1000, le=1000)
+    retry_policy_json: str = '{"max_attempts":3}'
+    needs_review: bool = False
+    depth: int = Field(default=0, ge=0, le=100)
+
+    @field_validator("retry_policy_json")
+    @classmethod
+    def validate_retry_policy(cls, value: str) -> str:
+        try:
+            policy = json.loads(value)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("retry_policy_json must be valid JSON") from exc
+        if not isinstance(policy, dict):
+            raise ValueError("retry_policy_json must encode an object")
+        attempts = policy.get("max_attempts", 3)
+        if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 100:
+            raise ValueError("max_attempts must be an integer between 1 and 100")
+        return value
+
+
+class DependencySpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    work_item: str = Field(min_length=1, max_length=256)
+    depends_on: str = Field(min_length=1, max_length=256)
+    condition: Literal["succeeded", "failed", "completed"] = "succeeded"
+
+
+class ArtifactSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ref: str = Field(min_length=1, max_length=4_096)
+    kind: str = Field(default="file", min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9._-]*$")
+    hash: Optional[str] = Field(default=None, max_length=256)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class Agent(BaseModel):
@@ -162,6 +213,8 @@ class Delivery(BaseModel):
     available_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     lease_expires_at: Optional[str] = None
     acked_at: Optional[str] = None
+    observed_at: Optional[str] = None
+    archived_at: Optional[str] = None
 
 
 class Approval(BaseModel):
@@ -176,6 +229,9 @@ class Approval(BaseModel):
     previous_work_status: Optional[str] = None
     decided_by: Optional[str] = None
     decided_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    reminder_count: int = 0
+    last_reminded_at: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 

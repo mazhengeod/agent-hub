@@ -1,4 +1,7 @@
 # Copy to ~/.config/agent-hub/config.yaml
+host: 127.0.0.1
+port: 8765
+
 session_lease_seconds: 300
 run_lease_seconds: 600
 offer_lease_seconds: 900
@@ -11,6 +14,13 @@ max_runs_per_task: 100
 max_work_items_per_task: 100
 max_work_depth: 6
 max_simultaneous_runs_per_agent: 4
+max_delivery_ack_batch: 200
+max_event_payload_bytes: 65536
+
+# Lifecycle hygiene. Pending deliveries for active tasks are never expired.
+delivery_terminal_retention_days: 30
+task_attention_hours: 24
+approval_ttl_seconds: 604800
 
 # Only these authenticated MCP agent IDs may resolve approvals.
 # Local `hubctl approve|reject` is always treated as the human operator path.

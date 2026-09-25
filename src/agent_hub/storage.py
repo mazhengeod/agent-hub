@@ -718,6 +718,43 @@ def list_deliveries_since(conn, recipient_kind, recipient_id,
     return [_row_dict(r) for r in rows]
 
 
+def mark_deliveries_observed(conn, delivery_ids):
+    """Record that deliveries were returned to a consumer without acking them."""
+    ids = list(dict.fromkeys(delivery_ids))
+    if not ids:
+        return 0
+    placeholders = ",".join("?" * len(ids))
+    cur = conn.execute(
+        f"""UPDATE deliveries SET observed_at=COALESCE(observed_at, ?)
+            WHERE id IN ({placeholders}) AND status='pending'""",
+        [now_iso()] + ids,
+    )
+    return cur.rowcount
+
+
+def advance_consumer_cursor(conn, consumer_kind, consumer_id, high_watermark,
+                            stream="events"):
+    """Monotonically advance an observation cursor; it is not an ack boundary."""
+    conn.execute(
+        """INSERT INTO consumer_cursors
+           (consumer_kind, consumer_id, stream, high_watermark, updated_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(consumer_kind, consumer_id, stream) DO UPDATE SET
+             high_watermark=MAX(consumer_cursors.high_watermark, excluded.high_watermark),
+             updated_at=excluded.updated_at""",
+        (consumer_kind, consumer_id, stream, int(high_watermark), now_iso()),
+    )
+
+
+def get_consumer_cursor(conn, consumer_kind, consumer_id, stream="events"):
+    row = conn.execute(
+        """SELECT high_watermark FROM consumer_cursors
+           WHERE consumer_kind=? AND consumer_id=? AND stream=?""",
+        (consumer_kind, consumer_id, stream),
+    ).fetchone()
+    return int(row["high_watermark"]) if row else 0
+
+
 def ack_delivery(conn, delivery_id, recipient_id, recipient_kind="agent"):
     cur = conn.execute(
         """UPDATE deliveries SET status='acked', acked_at=?
@@ -726,10 +763,52 @@ def ack_delivery(conn, delivery_id, recipient_id, recipient_kind="agent"):
     return cur.rowcount > 0
 
 
+def ack_deliveries(conn, delivery_ids, recipient_id, recipient_kind="agent"):
+    """Idempotently ack a validated batch belonging to one recipient."""
+    ids = list(dict.fromkeys(delivery_ids))
+    if not ids:
+        return 0, 0
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"""SELECT id, status FROM deliveries
+            WHERE id IN ({placeholders}) AND recipient_kind=? AND recipient_id=?""",
+        ids + [recipient_kind, recipient_id],
+    ).fetchall()
+    if len(rows) != len(ids):
+        return None
+    pending = [r["id"] for r in rows if r["status"] == "pending"]
+    if pending:
+        pending_placeholders = ",".join("?" * len(pending))
+        conn.execute(
+            f"""UPDATE deliveries SET status='acked', acked_at=?
+                WHERE id IN ({pending_placeholders}) AND status='pending'""",
+            [now_iso()] + pending,
+        )
+    return len(pending), len(ids) - len(pending)
+
+
 def expire_stale_deliveries(conn):
     cur = conn.execute(
         "UPDATE deliveries SET status='expired' WHERE status='pending' AND lease_expires_at < ?",
         (now_iso(),))
+    return cur.rowcount
+
+
+def archive_terminal_task_deliveries(conn, older_than):
+    """Expire old pending deliveries only after their task reached a terminal state."""
+    cur = conn.execute(
+        """UPDATE deliveries
+           SET status='expired', archived_at=?
+           WHERE status='pending'
+             AND event_id IN (
+                 SELECT e.event_id
+                 FROM events e
+                 JOIN tasks t ON t.id=e.task_id
+                 WHERE t.status IN ('completed','failed','cancelled','archived')
+                   AND e.created_at < ?
+             )""",
+        (now_iso(), older_than),
+    )
     return cur.rowcount
 
 
@@ -776,11 +855,11 @@ def lease_outbox_for_adapter(conn, adapter_id, lease_seconds=60, limit=20):
         ids).fetchall()]
 
 
-def mark_outbox_delivered(conn, outbox_id):
+def mark_outbox_delivered(conn, outbox_id, resolution="adapter_ack"):
     conn.execute(
         """UPDATE outbox SET status='delivered', delivered_at=?, lease_expires_at=NULL,
-           last_error=NULL WHERE id=? AND status IN ('pending','leased')""",
-        (now_iso(), outbox_id))
+           last_error=NULL, resolution=? WHERE id=? AND status IN ('pending','leased')""",
+        (now_iso(), resolution, outbox_id))
 
 
 def retry_outbox(conn, outbox_id, error="dispatch_failed", delay_seconds=5):
@@ -815,13 +894,15 @@ def count_outbox_by_status(conn):
 # ════════════════════════════════════════════════════════════════════
 
 def create_approval(conn, task_id, action, reason="", work_item_id=None, run_id=None,
-                    previous_task_status=None, previous_work_status=None):
+                    previous_task_status=None, previous_work_status=None,
+                    expires_at=None):
     ap_id = new_id()
     conn.execute(
         """INSERT INTO approvals (id, task_id, work_item_id, run_id, action, reason,
-           previous_task_status, previous_work_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+           previous_task_status, previous_work_status, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (ap_id, task_id, work_item_id, run_id, action, reason,
-         previous_task_status, previous_work_status))
+         previous_task_status, previous_work_status, expires_at))
     row = conn.execute("SELECT * FROM approvals WHERE id=?", (ap_id,)).fetchone()
     return Approval(**_row_dict(row))
 
@@ -847,6 +928,25 @@ def list_pending_approvals(conn, task_id=None):
         rows = conn.execute(
             "SELECT * FROM approvals WHERE decision IS NULL ORDER BY created_at").fetchall()
     return [Approval(**_row_dict(r)) for r in rows]
+
+
+def list_expired_pending_approvals(conn):
+    rows = conn.execute(
+        """SELECT * FROM approvals
+           WHERE decision IS NULL AND expires_at IS NOT NULL AND expires_at < ?
+             AND (last_reminded_at IS NULL OR last_reminded_at < expires_at)
+           ORDER BY created_at""",
+        (now_iso(),),
+    ).fetchall()
+    return [Approval(**_row_dict(r)) for r in rows]
+
+
+def mark_approval_reminded(conn, approval_id):
+    conn.execute(
+        """UPDATE approvals SET reminder_count=reminder_count+1, last_reminded_at=?
+           WHERE id=? AND decision IS NULL""",
+        (now_iso(), approval_id),
+    )
 
 
 def list_pending_approvals_for_agent(conn, agent_id):

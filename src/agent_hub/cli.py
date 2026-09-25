@@ -2,6 +2,8 @@
 
 Commands:
   hubctl status           - show hub diagnostics
+  hubctl doctor [--json]  - read-only integrity, migration, permission checks
+  hubctl backup [path]    - create a verified SQLite online backup
   hubctl tasks            - list tasks
   hubctl task <id>        - show task detail with work items
   hubctl reconcile        - run scheduler reconcile manually
@@ -19,6 +21,7 @@ from typing import Optional
 from . import service
 from .db import init_db, get_db
 from . import storage
+from .ops import backup_database, doctor_database
 
 
 def main(argv: Optional[list[str]] = None):
@@ -28,10 +31,35 @@ def main(argv: Optional[list[str]] = None):
         return 0
 
     cmd = argv[0]
+
+    if cmd == "doctor":
+        result = doctor_database()
+        if "--json" in argv[1:]:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"Agent Hub doctor: {'OK' if result['ok'] else 'ATTENTION'}")
+            print(f"DB: {result['db_path']}")
+            for name, check in result["checks"].items():
+                marker = "ok" if check["ok"] else "FAIL"
+                line = f"  [{marker}] {name}: {check.get('value')}"
+                if check.get("detail"):
+                    line += f" ({check['detail']})"
+                print(line)
+        return 0 if result["ok"] else 2
+
+    if cmd == "backup":
+        destination = argv[1] if len(argv) > 1 else None
+        result = backup_database(destination=destination)
+        print(json.dumps(result, indent=2))
+        return 0
+
     init_db()
 
     if cmd == "status":
         status = service.hub_status()
+        if "--json" in argv[1:]:
+            print(json.dumps(status, indent=2))
+            return 0
         print(f"Agent Hub v{status['version']}")
         print(f"DB: {status['db_path']}")
         print(f"Migrations: {status['migrations']}")
@@ -87,7 +115,10 @@ def main(argv: Optional[list[str]] = None):
         if not approvals:
             print("No pending approvals.")
         for a in approvals:
-            print(f"  {a.id}  task={a.task_id}  action={a.action}  reason={a.reason}")
+            print(
+                f"  {a.id}  task={a.task_id}  action={a.action}  "
+                f"expires={a.expires_at or 'legacy'}  reason={a.reason}"
+            )
 
     elif cmd in ("approve", "reject"):
         if len(argv) < 2:

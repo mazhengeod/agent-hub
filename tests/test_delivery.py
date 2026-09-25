@@ -76,6 +76,46 @@ def test_delivery_ack_wrong_agent_rejected(db_path, make_session):
     assert exc.value.code == "delivery_not_found"
 
 
+def test_delivery_batch_ack_is_idempotent_and_observation_is_not_ack(db_path, make_session):
+    sess = make_session("agent-a")
+    service.create_task("Task", "agent-a")
+
+    result = service.agent_sync("agent-a", sess["session_id"])
+    delivery_ids = [item["delivery_id"] for item in result["deliveries"]]
+    assert delivery_ids
+    assert result["delivery_state"]["ack_required"] is True
+
+    conn = get_db()
+    observed = conn.execute(
+        "SELECT observed_at, status FROM deliveries WHERE id=?",
+        (delivery_ids[0],),
+    ).fetchone()
+    assert observed["observed_at"] is not None
+    assert observed["status"] == "pending"
+
+    first = service.ack_deliveries("agent-a", delivery_ids)
+    assert first["acked"] == len(delivery_ids)
+    second = service.ack_deliveries("agent-a", delivery_ids)
+    assert second["acked"] == 0
+    assert second["already_final"] == len(delivery_ids)
+
+
+def test_delivery_batch_rejects_cross_agent_ids_atomically(db_path, make_session):
+    a = make_session("agent-a")
+    b = make_session("agent-b")
+    service.create_task("A", "agent-a")
+    service.create_task("B", "agent-b")
+    a_id = service.agent_sync("agent-a", a["session_id"])["deliveries"][0]["delivery_id"]
+    b_id = service.agent_sync("agent-b", b["session_id"])["deliveries"][0]["delivery_id"]
+
+    with pytest.raises(HubError) as exc:
+        service.ack_deliveries("agent-a", [a_id, b_id])
+    assert exc.value.code == "delivery_not_found"
+    assert get_db().execute(
+        "SELECT status FROM deliveries WHERE id=?", (a_id,)
+    ).fetchone()["status"] == "pending"
+
+
 def test_outbox_created_on_claim(db_path, make_session):
     """Claiming work enqueues outbox for adapter dispatch."""
     sess = make_session("agent-a")
@@ -121,6 +161,12 @@ def test_outbox_processed_by_reconcile(db_path, make_session):
         "SELECT COUNT(*) AS n FROM outbox WHERE status='delivered'"
     ).fetchone()["n"]
     assert delivered > 0
+    resolutions = {
+        row["resolution"] for row in conn.execute(
+            "SELECT resolution FROM outbox WHERE status='delivered'"
+        ).fetchall()
+    }
+    assert "no_adapter" in resolutions
 
 
 def test_outbox_survives_restart(db_path, make_session):
@@ -215,3 +261,25 @@ def test_hub_status_diagnostics(db_path, make_session):
     assert "migrations" in status
     assert status["counts"]["tasks"] >= 1
     assert len(status["migrations"]) >= 1
+    assert "delivery_backlog_by_recipient" in status["health"]
+    assert "running_tasks_without_coordinator" in status["health"]
+
+
+def test_reconcile_archives_only_old_terminal_task_deliveries(db_path):
+    task = service.create_task("Old terminal task", "agent-a")
+    conn = get_db()
+    conn.execute("UPDATE tasks SET status='completed' WHERE id=?", (task["id"],))
+    conn.execute(
+        "UPDATE events SET created_at='2000-01-01T00:00:00+00:00' WHERE task_id=?",
+        (task["id"],),
+    )
+
+    result = service.reconcile()
+    assert result["archived_terminal_deliveries"] >= 1
+    row = conn.execute(
+        """SELECT d.status, d.archived_at FROM deliveries d
+           JOIN events e ON e.event_id=d.event_id WHERE e.task_id=?""",
+        (task["id"],),
+    ).fetchone()
+    assert row["status"] == "expired"
+    assert row["archived_at"] is not None
