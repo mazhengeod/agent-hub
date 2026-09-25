@@ -36,6 +36,30 @@ def test_retry_policy_object_remains_backward_compatible(db_path):
     assert json.loads(work_item["retry_policy_json"])["max_attempts"] == 5
 
 
+@pytest.mark.parametrize(
+    "retry_fields",
+    [
+        {"retry_policy": {"max_attempts": 0}},
+        {"retry_policy": {"max_attempts": 3, "jitter": float("nan")}},
+        {
+            "retry_policy": {"max_attempts": 3},
+            "retry_policy_json": '{"max_attempts":3}',
+        },
+    ],
+)
+def test_invalid_retry_policies_are_rejected_without_mutation(
+        db_path, retry_fields):
+    task = service.create_task("Task", "agent-a")
+    with pytest.raises(HubError) as exc:
+        service.plan_task(
+            task["id"],
+            [{"kind": "implement", "objective": "work", **retry_fields}],
+            actor_agent_id="agent-a",
+        )
+    assert exc.value.code == "invalid_work_item"
+    assert storage.count_work_items(get_db(), task["id"]) == 0
+
+
 def test_work_complete_rejects_artifact_without_ref_before_mutation(
         db_path, claim_and_start):
     claimed = claim_and_start()

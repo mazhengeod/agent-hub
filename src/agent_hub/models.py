@@ -29,6 +29,7 @@ class WorkItemSpec(BaseModel):
     required_capabilities: list[str] = Field(default_factory=list, max_length=100)
     preferred_agent_id: Optional[str] = Field(default=None, min_length=1, max_length=256)
     priority: int = Field(default=0, ge=-1000, le=1000)
+    # Public object form is normalized to the storage-facing JSON string.
     retry_policy: Optional[dict[str, Any]] = None
     retry_policy_json: Optional[str] = None
     needs_review: bool = False
@@ -53,7 +54,9 @@ class WorkItemSpec(BaseModel):
         if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 100:
             raise ValueError("max_attempts must be an integer between 1 and 100")
         try:
-            self.retry_policy_json = json.dumps(policy, separators=(",", ":"))
+            self.retry_policy_json = json.dumps(
+                policy, separators=(",", ":"), allow_nan=False
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError("retry policy must be JSON serializable") from exc
         self.retry_policy = None

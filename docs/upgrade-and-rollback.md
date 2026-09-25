@@ -6,10 +6,10 @@ separate gates. A passing test suite does not prove a successful deployment.
 ## Preflight
 
 1. Record the current release identifier and service unit.
-2. Run `hubctl doctor --allow-pending-migrations`; resolve database integrity,
+2. Run `hubctl backup` and retain the reported database plus `.sha256` file.
+3. Run `hubctl doctor --allow-pending-migrations`; resolve database integrity,
    migration checksum or permission failures. Pending new migrations are expected
    at this pre-upgrade stage and are reported explicitly.
-3. Run `hubctl backup` and retain the reported database plus `.sha256` file.
 4. Build the candidate with `python -m build` and install its wheel into a clean
    virtual environment. Do not deploy from an editable checkout.
 5. Start the candidate on another port against a copy of the database. Run

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from agent_hub import cli
 from agent_hub.ops import backup_database, doctor_database
 
 
@@ -34,6 +35,19 @@ def test_doctor_can_allow_pending_migrations_for_preflight(db_path):
     preflight = doctor_database(db_path, allow_pending_migrations=True)
     assert preflight["checks"]["migrations"]["ok"] is True
     assert preflight["checks"]["migrations"]["value"]["pending"] == [2]
+
+
+def test_doctor_cli_passes_allow_pending_flag(monkeypatch, capsys):
+    called = {}
+
+    def fake_doctor_database(*, allow_pending_migrations=False):
+        called["allow_pending_migrations"] = allow_pending_migrations
+        return {"ok": True, "db_path": "/tmp/hub.db", "checks": {}}
+
+    monkeypatch.setattr(cli, "doctor_database", fake_doctor_database)
+    assert cli.main(["doctor", "--allow-pending-migrations", "--json"]) == 0
+    assert called["allow_pending_migrations"] is True
+    assert '"ok": true' in capsys.readouterr().out
 
 
 def test_online_backup_is_consistent(db_path, tmp_path):
