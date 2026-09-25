@@ -132,7 +132,7 @@ opencode=your-opencode-token
 升级时不要删除数据库。先用 SQLite 在线备份并验证，再重启服务：
 
 ```bash
-hubctl doctor
+hubctl doctor --allow-pending-migrations  # 升级前完整性检查
 hubctl backup
 systemctl --user daemon-reload
 systemctl --user enable --now agent-hub.service
@@ -287,6 +287,7 @@ Handler 可以是同步或异步，返回值规则：
 hubctl status              # 查看运行诊断
 hubctl status --json       # 机器可读诊断
 hubctl doctor              # 严格只读的数据库、配置和权限检查
+hubctl doctor --allow-pending-migrations  # 对旧 schema 做升级前检查
 hubctl backup              # SQLite 在线备份并生成 SHA256 旁车文件
 hubctl tasks               # 列出任务
 hubctl tasks running       # 按状态过滤

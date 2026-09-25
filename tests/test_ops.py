@@ -23,6 +23,19 @@ def test_doctor_is_read_only_and_reports_current_migrations(db_path):
     assert before == after
 
 
+def test_doctor_can_allow_pending_migrations_for_preflight(db_path):
+    connection = sqlite3.connect(db_path)
+    connection.execute("DELETE FROM schema_migrations WHERE version=2")
+    connection.commit()
+    connection.close()
+
+    strict = doctor_database(db_path)
+    assert strict["checks"]["migrations"]["ok"] is False
+    preflight = doctor_database(db_path, allow_pending_migrations=True)
+    assert preflight["checks"]["migrations"]["ok"] is True
+    assert preflight["checks"]["migrations"]["value"]["pending"] == [2]
+
+
 def test_online_backup_is_consistent(db_path, tmp_path):
     destination = tmp_path / "backup" / "hub.db"
     result = backup_database(db_path, str(destination))

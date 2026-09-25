@@ -19,7 +19,8 @@ def _mode(path: Path) -> Optional[str]:
     return f"{stat.S_IMODE(path.stat().st_mode):04o}"
 
 
-def doctor_database(db_path: Optional[str] = None) -> dict:
+def doctor_database(db_path: Optional[str] = None,
+                    allow_pending_migrations: bool = False) -> dict:
     """Inspect an existing database without creating files or running migrations."""
     path = Path(db_path) if db_path else DEFAULT_DB_PATH
     checks: dict[str, dict] = {}
@@ -85,8 +86,14 @@ def doctor_database(db_path: Optional[str] = None) -> dict:
         )
         record(
             "migrations",
-            not missing and not mismatched and bool(expected),
-            {"applied": sorted(applied), "expected": sorted(expected)},
+            (allow_pending_migrations or not missing)
+            and not mismatched
+            and bool(expected),
+            {
+                "applied": sorted(applied),
+                "expected": sorted(expected),
+                "pending": missing,
+            },
             f"missing={missing}, checksum_mismatch={mismatched}"
             if missing or mismatched or not expected else None,
         )

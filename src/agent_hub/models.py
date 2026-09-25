@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import json
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class WorkItemSpec(BaseModel):
@@ -29,23 +29,35 @@ class WorkItemSpec(BaseModel):
     required_capabilities: list[str] = Field(default_factory=list, max_length=100)
     preferred_agent_id: Optional[str] = Field(default=None, min_length=1, max_length=256)
     priority: int = Field(default=0, ge=-1000, le=1000)
-    retry_policy_json: str = '{"max_attempts":3}'
+    retry_policy: Optional[dict[str, Any]] = None
+    retry_policy_json: Optional[str] = None
     needs_review: bool = False
     depth: int = Field(default=0, ge=0, le=100)
 
-    @field_validator("retry_policy_json")
-    @classmethod
-    def validate_retry_policy(cls, value: str) -> str:
-        try:
-            policy = json.loads(value)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("retry_policy_json must be valid JSON") from exc
+    @model_validator(mode="after")
+    def normalize_retry_policy(self):
+        if self.retry_policy is not None and self.retry_policy_json is not None:
+            raise ValueError("provide retry_policy or retry_policy_json, not both")
+        if self.retry_policy is not None:
+            policy = self.retry_policy
+        elif self.retry_policy_json is not None:
+            try:
+                policy = json.loads(self.retry_policy_json)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("retry_policy_json must be valid JSON") from exc
+        else:
+            policy = {"max_attempts": 3}
         if not isinstance(policy, dict):
-            raise ValueError("retry_policy_json must encode an object")
+            raise ValueError("retry policy must be an object")
         attempts = policy.get("max_attempts", 3)
         if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 100:
             raise ValueError("max_attempts must be an integer between 1 and 100")
-        return value
+        try:
+            self.retry_policy_json = json.dumps(policy, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("retry policy must be JSON serializable") from exc
+        self.retry_policy = None
+        return self
 
 
 class DependencySpec(BaseModel):

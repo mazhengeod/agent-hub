@@ -1,6 +1,8 @@
 """Boundary validation prevents malformed MCP payloads from reaching transactions."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from agent_hub import service, storage
@@ -14,6 +16,24 @@ def test_task_plan_rejects_non_object_work_item(db_path):
         service.plan_task(task["id"], ["not-an-object"], actor_agent_id="agent-a")
     assert exc.value.code == "invalid_work_item"
     assert storage.count_work_items(get_db(), task["id"]) == 0
+
+
+def test_retry_policy_object_remains_backward_compatible(db_path):
+    task = service.create_task("Task", "agent-a")
+    service.plan_task(
+        task["id"],
+        [{
+            "kind": "implement",
+            "objective": "work",
+            "retry_policy": {"max_attempts": 5},
+        }],
+        actor_agent_id="agent-a",
+    )
+    work_item = get_db().execute(
+        "SELECT retry_policy_json FROM work_items WHERE task_id=?",
+        (task["id"],),
+    ).fetchone()
+    assert json.loads(work_item["retry_policy_json"])["max_attempts"] == 5
 
 
 def test_work_complete_rejects_artifact_without_ref_before_mutation(

@@ -2,7 +2,8 @@
 
 Commands:
   hubctl status           - show hub diagnostics
-  hubctl doctor [--json]  - read-only integrity, migration, permission checks
+  hubctl doctor [--json] [--allow-pending-migrations]
+                           - read-only integrity, migration, permission checks
   hubctl backup [path]    - create a verified SQLite online backup
   hubctl tasks            - list tasks
   hubctl task <id>        - show task detail with work items
@@ -33,7 +34,9 @@ def main(argv: Optional[list[str]] = None):
     cmd = argv[0]
 
     if cmd == "doctor":
-        result = doctor_database()
+        result = doctor_database(
+            allow_pending_migrations="--allow-pending-migrations" in argv[1:]
+        )
         if "--json" in argv[1:]:
             print(json.dumps(result, indent=2))
         else:

@@ -154,7 +154,7 @@ work_complete({
   fencing_token: 1,
   status: "succeeded",   // 或 "failed"
   session_id: "abc123",
-  artifacts: [{type: "commit", value: "abc1234"}]
+  artifacts: [{kind: "commit", ref: "abc1234"}]
 })
 ```
 

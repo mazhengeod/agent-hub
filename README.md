@@ -114,7 +114,7 @@ Never delete the database to upgrade. Back it up with SQLite's online backup API
 verify it, then restart the service:
 
 ```bash
-hubctl doctor
+hubctl doctor --allow-pending-migrations  # pre-upgrade integrity check
 hubctl backup
 systemctl --user daemon-reload
 systemctl --user enable --now agent-hub.service
@@ -256,6 +256,7 @@ shell command.
 hubctl status              # show hub diagnostics
 hubctl status --json       # machine-readable diagnostics
 hubctl doctor              # strictly read-only DB/config/permission checks
+hubctl doctor --allow-pending-migrations  # pre-upgrade check of an older schema
 hubctl backup              # online SQLite backup plus SHA256 sidecar
 hubctl tasks               # list tasks
 hubctl tasks running       # filter by status
