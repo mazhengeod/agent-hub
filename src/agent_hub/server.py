@@ -8,16 +8,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import Middleware
 
 from . import service
 from .auth import verify_token
 from .config import get_config
 from .db import init_db
-from .models import HubError
+from .models import ArtifactSpec, DependencySpec, HubError, WorkItemSpec
 
 log = logging.getLogger("agent_hub.server")
 RECONCILE_INTERVAL = int(get_config("reconcile_interval_seconds", 15))
@@ -65,6 +68,22 @@ async def _scheduler_loop():
 
 
 mcp = FastMCP("agent-hub", lifespan=hub_lifespan)
+
+
+class HubErrorMiddleware(Middleware):
+    """Expose stable domain errors without treating expected conflicts as crashes."""
+
+    async def on_call_tool(self, context, call_next):
+        try:
+            return await call_next(context)
+        except HubError as exc:
+            log.info("Hub request rejected code=%s message=%s", exc.code, exc.message)
+            raise ToolError(
+                f"{exc.code}: {exc.message}", log_level=logging.INFO
+            ) from None
+
+
+mcp.add_middleware(HubErrorMiddleware())
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -137,8 +156,8 @@ def task_list(status: Optional[str] = None, limit: int = 50) -> list[dict]:
 
 
 @mcp.tool()
-def task_plan(task_id: str, work_items: list[dict],
-              dependencies: Optional[list[dict]] = None,
+def task_plan(task_id: str, work_items: list[WorkItemSpec],
+              dependencies: Optional[list[DependencySpec]] = None,
               coordinator_token: Optional[int] = None,
               coordinator_session_id: Optional[str] = None) -> dict:
     """Create work items and dependencies for a task.
@@ -260,7 +279,7 @@ def work_checkpoint(run_id: str, fencing_token: int, session_id: str,
 @mcp.tool()
 def work_complete(run_id: str, fencing_token: int, status: str,
                   session_id: str,
-                  artifacts: Optional[list] = None,
+                  artifacts: Optional[list[ArtifactSpec]] = None,
                   failure_code: Optional[str] = None,
                   failure_detail: Optional[dict] = None) -> dict:
     """Complete a run. status: 'succeeded' or 'failed'."""
@@ -280,8 +299,8 @@ def work_resume(run_id: str, session_id: str,
 @mcp.tool()
 def work_spawn_child(run_id: str, fencing_token: int,
                      session_id: str,
-                     work_items: list[dict],
-                     dependencies: Optional[list[dict]] = None) -> dict:
+                     work_items: list[WorkItemSpec],
+                     dependencies: Optional[list[DependencySpec]] = None) -> dict:
     """Dynamically add child work within the current task budget."""
     return service.spawn_child_work(run_id, fencing_token, _agent_from_request(),
                                     work_items, dependencies, session_id)
@@ -381,6 +400,12 @@ def delivery_ack(delivery_id: str) -> dict:
 
 
 @mcp.tool()
+def delivery_ack_batch(delivery_ids: list[str]) -> dict:
+    """Idempotently acknowledge a bounded batch of deliveries."""
+    return service.ack_deliveries(_agent_from_request(), delivery_ids)
+
+
+@mcp.tool()
 def hub_status() -> dict:
     """Runtime diagnostics."""
     _agent_from_request()
@@ -418,7 +443,9 @@ def main():
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
-    mcp.run(transport="http", host="127.0.0.1", port=8765, path="/mcp")
+    host = os.environ.get("AGENT_HUB_HOST", str(get_config("host", "127.0.0.1")))
+    port = int(os.environ.get("AGENT_HUB_PORT", get_config("port", 8765)))
+    mcp.run(transport="http", host=host, port=port, path="/mcp")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ Design rules (per architecture audit):
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import sqlite3
 import time
@@ -19,8 +20,19 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Callable, Any
 
-DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "agent-hub" / "hub.db"
-MIGRATIONS_DIR = Path(__file__).parent.parent.parent / "migrations"
+DEFAULT_DB_PATH = Path(
+    os.environ.get(
+        "AGENT_HUB_DB",
+        str(Path.home() / ".local" / "share" / "agent-hub" / "hub.db"),
+    )
+)
+PACKAGE_MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+SOURCE_MIGRATIONS_DIR = Path(__file__).parent.parent.parent / "migrations"
+MIGRATIONS_DIR = (
+    PACKAGE_MIGRATIONS_DIR
+    if PACKAGE_MIGRATIONS_DIR.exists()
+    else SOURCE_MIGRATIONS_DIR
+)
 
 
 # ── Time helpers ───────────────────────────────────────────────────
@@ -53,12 +65,17 @@ def next_fencing_token(conn: sqlite3.Connection) -> int:
 def get_db(db_path: Optional[str] = None) -> sqlite3.Connection:
     """Get a WAL-mode connection. isolation_level=None so only UoW controls transactions."""
     path = db_path or str(DEFAULT_DB_PATH)
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    path_obj = Path(path)
+    path_obj.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path_obj.parent.chmod(0o700)
     conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
+    for runtime_file in (path_obj, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        if runtime_file.exists():
+            runtime_file.chmod(0o600)
     return conn
 
 
@@ -169,7 +186,7 @@ def run_migrations(conn: sqlite3.Connection) -> list[int]:
     applied = {r["version"]: r["checksum"] for r in applied_rows}
 
     if not MIGRATIONS_DIR.exists():
-        return []
+        raise RuntimeError(f"Migration directory is missing: {MIGRATIONS_DIR}")
 
     migration_files = sorted(
         f for f in MIGRATIONS_DIR.glob("*.sql")

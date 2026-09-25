@@ -4,9 +4,9 @@
 
 ### 任务驱动的多 Agent 协调控制平面
 
-[![version](https://img.shields.io/badge/version-0.5.0-4B3FE3)](pyproject.toml)
+[![version](https://img.shields.io/badge/version-0.6.0-4B3FE3)](pyproject.toml)
 [![python](https://img.shields.io/badge/python-3.11+-3776AB)](pyproject.toml)
-[![tests](https://img.shields.io/badge/tests-67%20passed-1DC981)](#验证)
+[![tests](https://img.shields.io/badge/tests-pytest-1DC981)](#验证)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 [English](README.md) | **中文**
@@ -39,7 +39,7 @@ Agent Hub 是一个面向多 Agent 协作的任务驱动控制平面。它不是
 - **Run** 是一次具体的执行尝试，绑定租约和 fencing token，可跨 session 恢复
 - **Session** 是 Agent 的短生命周期执行端点，同一 Agent 可同时拥有多个活跃 Session
 
-v0.5 是全新架构，不兼容旧版 round/message/assignment schema。设计目标：**让 Agent 可以在任何时候中断、恢复、切换，而任务状态永不丢失**。
+v0.6 可通过带校验和的 migration 原地升级 v0.5 数据库；更早的 round/message/assignment schema 仍不受支持。设计目标：**让 Agent 可以在任何时候中断、恢复、切换，而任务状态永不丢失**。
 
 ### 已实现能力
 
@@ -104,9 +104,8 @@ Task（任务 - 唯一聚合根）
 ### 1. 安装（WSL 环境）
 
 ```bash
-cd ~/agent-hub
 python3 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
+.venv/bin/pip install agent-hub-mcp
 ```
 
 ### 2. 配置
@@ -128,15 +127,16 @@ opencode=your-opencode-token
 
 > **安全须知**：Token 仅从 HTTP `Authorization: Bearer ...` header 读取，绝不作为 MCP 工具参数暴露。
 
-### 3. 首次启动（清除旧数据）
+### 3. 备份并启动
 
-v0.5 不兼容旧 schema，首次启动前必须删除旧数据库：
+升级时不要删除数据库。先用 SQLite 在线备份并验证，再重启服务：
 
 ```bash
-systemctl --user stop agent-hub.service
-rm -f ~/.local/share/agent-hub/hub.db*
+hubctl backup
+hubctl doctor --allow-pending-migrations  # 升级前完整性检查
 systemctl --user daemon-reload
 systemctl --user enable --now agent-hub.service
+hubctl doctor
 ```
 
 只有一个服务进程。Scheduler 运行在 FastMCP lifespan 内部，所有写入共享同一个进程内单写者门控。
@@ -150,13 +150,13 @@ systemctl --user enable --now agent-hub.service
 5. 在有意义的边界保存 Checkpoint
 6. 完成、阻塞或请求审批--不要让 Run 静默挂起
 
-> `since_event_id` 只是排序提示。未 ack 的 Delivery 会一直重投，直到调用 `delivery_ack`，防止游标推进导致工作丢失。
+> `agent_sync` 只标记 Delivery 已观察并推进观察游标，不会确认处理成功。未 ack 的 Delivery 会一直重投，直到 `delivery_ack` 或 `delivery_ack_batch` 成功。
 
 ---
 
 ## MCP 工具
 
-共 37 个 MCP 工具，按功能分组：
+共 38 个 MCP 工具，按功能分组：
 
 ### Session 管理
 
@@ -217,6 +217,7 @@ systemctl --user enable --now agent-hub.service
 |---|---|
 | `agent_sync` | 批量拉取：心跳 + 待办工作 + 游标投递 + 活跃 Run |
 | `delivery_ack` | 确认投递（非破坏性，每接收方独立） |
+| `delivery_ack_batch` | 原子确认有上限的一批投递 |
 | `event_post` | 幂等发布事件 |
 
 ### Adapter
@@ -284,6 +285,10 @@ Handler 可以是同步或异步，返回值规则：
 
 ```bash
 hubctl status              # 查看运行诊断
+hubctl status --json       # 机器可读诊断
+hubctl doctor              # 严格只读的数据库、配置和权限检查
+hubctl doctor --allow-pending-migrations  # 对旧 schema 做升级前检查
+hubctl backup              # SQLite 在线备份并生成 SHA256 旁车文件
 hubctl tasks               # 列出任务
 hubctl tasks running       # 按状态过滤
 hubctl task <task-id>      # 查看任务详情（含 WorkItem 和 Run）
@@ -382,9 +387,18 @@ operator_agent_ids:                 # 可决定审批的 Agent
 
 # 编译检查
 .venv/bin/python -m compileall -q src tests
+
+# 构建 wheel 和 sdist
+python -m build
 ```
 
-测试覆盖（67 个用例全部通过）：
+测试覆盖事务、migration、输入校验、权限、DAG、恢复、review、投递与
+outbox 语义、运维诊断、审批和 adapter。CI 还会在干净环境安装构建出的
+wheel，并检查 migration 是否随包发布。
+
+生产切换前请阅读[升级与回滚](docs/upgrade-and-rollback.md)。
+
+历史测试文件覆盖如下：
 
 | 测试文件 | 用例数 | 覆盖场景 |
 |---|---|---|

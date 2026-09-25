@@ -15,12 +15,23 @@ Per Codex hardening review:
 from __future__ import annotations
 
 import json
+import re
 from datetime import timedelta, timezone, datetime
 from typing import Optional
 
+from pydantic import ValidationError
+
 from . import storage
 from .db import now_iso, new_id, iso_plus_seconds, write_executor, get_db
-from .models import Task, WorkItem, Run, HubError
+from .models import (
+    ArtifactSpec,
+    DependencySpec,
+    HubError,
+    Run,
+    Task,
+    WorkItem,
+    WorkItemSpec,
+)
 from .config import get_config
 
 DEFAULT_SESSION_LEASE = int(get_config("session_lease_seconds", 300))
@@ -32,6 +43,13 @@ MAX_WORK_DEPTH = int(get_config("max_work_depth", 6))
 DEFAULT_COORDINATOR_LEASE = int(get_config("coordinator_lease_seconds", 600))
 DEFAULT_OUTBOX_LEASE = int(get_config("outbox_lease_seconds", 60))
 DEFAULT_OFFER_LEASE = int(get_config("offer_lease_seconds", 900))
+DEFAULT_APPROVAL_TTL = int(get_config("approval_ttl_seconds", 604800))
+DELIVERY_TERMINAL_RETENTION_DAYS = int(
+    get_config("delivery_terminal_retention_days", 30)
+)
+TASK_ATTENTION_HOURS = int(get_config("task_attention_hours", 24))
+MAX_EVENT_PAYLOAD_BYTES = int(get_config("max_event_payload_bytes", 65536))
+MAX_DELIVERY_ACK_BATCH = int(get_config("max_delivery_ack_batch", 200))
 
 VALID_RUN_COMPLETION_STATUS = {"succeeded", "failed"}
 VALID_WORK_ITEM_STATUSES = {
@@ -43,6 +61,7 @@ VALID_APPROVAL_DECISIONS = {"approved", "rejected"}
 VALID_PARTICIPANT_ROLES = {"owner", "coordinator", "worker", "reviewer", "observer"}
 VALID_WORK_KINDS = {"plan", "research", "implement", "review", "verify", "operate", "summarize"}
 _RUNTIME_STATE = {"last_reconcile_at": None, "last_reconcile_result": {}}
+EVENT_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -76,6 +95,68 @@ def _json_obj(raw, default):
         return json.loads(raw) if isinstance(raw, str) else raw
     except (TypeError, json.JSONDecodeError) as exc:
         raise HubError("invalid_json", f"Invalid stored JSON: {exc}") from exc
+
+
+def _validation_error(code, message, exc):
+    detail = exc.errors(include_url=False, include_context=False)
+    raise HubError(code, f"{message}: {detail}") from None
+
+
+def _normalize_work_item_specs(work_items):
+    if not isinstance(work_items, list) or not work_items:
+        raise HubError("invalid_work_items", "work_items must be a non-empty list")
+    try:
+        return [
+            WorkItemSpec.model_validate(item).model_dump(exclude_none=True)
+            for item in work_items
+        ]
+    except ValidationError as exc:
+        _validation_error("invalid_work_item", "Invalid Work Item specification", exc)
+
+
+def _normalize_dependency_specs(dependencies):
+    if dependencies is None:
+        return []
+    if not isinstance(dependencies, list):
+        raise HubError("invalid_dependencies", "dependencies must be a list")
+    try:
+        return [
+            DependencySpec.model_validate(item).model_dump(exclude_none=True)
+            for item in dependencies
+        ]
+    except ValidationError as exc:
+        _validation_error("invalid_dependency", "Invalid dependency specification", exc)
+
+
+def _normalize_artifact_specs(artifacts):
+    if artifacts is None:
+        return []
+    if not isinstance(artifacts, list):
+        raise HubError("invalid_artifacts", "artifacts must be a list")
+    try:
+        return [
+            ArtifactSpec.model_validate(item).model_dump(exclude_none=True)
+            for item in artifacts
+        ]
+    except ValidationError as exc:
+        _validation_error("invalid_artifact", "Invalid artifact specification", exc)
+
+
+def _validate_event_input(event_type, payload):
+    if not isinstance(event_type, str) or not EVENT_TYPE_PATTERN.fullmatch(event_type):
+        raise HubError(
+            "invalid_event_type",
+            "event_type must match ^[a-z][a-z0-9_.-]{0,127}$",
+        )
+    try:
+        encoded = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise HubError("invalid_event_payload", f"payload must be JSON serializable: {exc}") from None
+    if len(encoded) > MAX_EVENT_PAYLOAD_BYTES:
+        raise HubError(
+            "event_payload_too_large",
+            f"event payload exceeds {MAX_EVENT_PAYLOAD_BYTES} bytes",
+        )
 
 
 def _assert_task_control(conn, task, actor_agent_id, coordinator_token=None,
@@ -182,6 +263,10 @@ def session_end(actor_agent_id, session_id):
 def create_task(objective, actor_agent_id, success_criteria=None,
                 constraints=None, authorization_policy=None, context_refs=None,
                 priority=0, deadline_at=None, budget=None):
+    if not isinstance(objective, str) or not objective.strip():
+        raise HubError("invalid_objective", "objective must be a non-empty string")
+    if len(objective) > 20_000:
+        raise HubError("invalid_objective", "objective exceeds 20000 characters")
     conn = get_db()
     task_id = new_id()
 
@@ -222,6 +307,8 @@ def list_tasks(status=None, limit=50, actor_agent_id=None):
 def plan_task(task_id, work_items, dependencies=None, actor_agent_id=None,
               coordinator_token=None, coordinator_session_id=None):
     """Create work items + dependencies. Validates DAG (cycle detection, same-task)."""
+    work_items = _normalize_work_item_specs(work_items)
+    dependencies = _normalize_dependency_specs(dependencies)
     conn = get_db()
 
     def _write(c):
@@ -674,6 +761,7 @@ def complete_run(run_id, fencing_token, status, actor_agent_id,
                  artifacts=None, failure_code=None, failure_detail=None,
                  session_id=None):
     """Complete a run. Enforces status whitelist + ownership."""
+    artifacts = _normalize_artifact_specs(artifacts)
     conn = get_db()
 
     if status not in VALID_RUN_COMPLETION_STATUS:
@@ -827,6 +915,8 @@ def resume_run(run_id, session_id, actor_agent_id, lease_seconds=None):
 def spawn_child_work(run_id, fencing_token, actor_agent_id, work_items,
                      dependencies=None, session_id=None):
     """Dynamically extend a running task from an active Run."""
+    work_items = _normalize_work_item_specs(work_items)
+    dependencies = _normalize_dependency_specs(dependencies)
     conn = get_db()
 
     def _write(c):
@@ -856,7 +946,10 @@ def spawn_child_work(run_id, fencing_token, actor_agent_id, work_items,
                 required_capabilities_json=json.dumps(spec.get("required_capabilities", [])),
                 preferred_agent_id=spec.get("preferred_agent_id"),
                 priority=spec.get("priority", parent.priority),
-                retry_policy_json=json.dumps(spec.get("retry_policy", {"max_attempts": MAX_RUN_ATTEMPTS})),
+                retry_policy_json=spec.get(
+                    "retry_policy_json",
+                    json.dumps({"max_attempts": MAX_RUN_ATTEMPTS}),
+                ),
                 needs_review=spec.get("needs_review", False))
             created[spec.get("ref", wi.id)] = wi.id
         for dep in dependencies or []:
@@ -1017,7 +1110,9 @@ def request_approval(task_id, action, reason="", work_item_id=None,
         ap = storage.create_approval(
             c, task_id, action, reason, work_item_id, run_id,
             previous_task_status=previous_task_status,
-            previous_work_status=previous_work_status)
+            previous_work_status=previous_work_status,
+            expires_at=iso_plus_seconds(DEFAULT_APPROVAL_TTL),
+        )
         _emit(c, task_id, "approval.requested",
               actor_agent_id=requested_by, work_item_id=work_item_id, run_id=run_id,
               payload={"action": action, "approval_id": ap.id},
@@ -1025,7 +1120,13 @@ def request_approval(task_id, action, reason="", work_item_id=None,
         return ap
 
     ap = write_executor.execute_write(conn, _write)
-    return {"approval_id": ap.id, "task_id": task_id, "action": action, "status": "pending"}
+    return {
+        "approval_id": ap.id,
+        "task_id": task_id,
+        "action": action,
+        "status": "pending",
+        "expires_at": ap.expires_at,
+    }
 
 
 def decide_approval(approval_id, decision, decided_by, is_operator=False):
@@ -1128,7 +1229,7 @@ def adapter_ack(actor_agent_id, adapter_id, outbox_id, success=True, error=""):
         if not item or item.get("adapter_id") != adapter_id or item["status"] != "leased":
             raise HubError("outbox_not_leased", "Outbox entry is not leased to this adapter")
         if success:
-            storage.mark_outbox_delivered(c, outbox_id)
+            storage.mark_outbox_delivered(c, outbox_id, resolution="adapter_ack")
             storage.update_adapter_health(c, adapter_id, True)
         else:
             attempts = int(item["attempts"]) + 1
@@ -1148,6 +1249,9 @@ def post_event(task_id, actor_agent_id, event_type, payload=None,
                work_item_id=None, run_id=None, recipients=None,
                idempotency_key=None):
     """Post a typed task-scoped coordination event."""
+    _validate_event_input(event_type, payload)
+    if recipients is not None and not isinstance(recipients, list):
+        raise HubError("invalid_recipients", "recipients must be a list")
     conn = get_db()
 
     def _write(c):
@@ -1185,6 +1289,8 @@ def post_event(task_id, actor_agent_id, event_type, payload=None,
 
 def agent_sync(actor_agent_id, session_id, since_event_id=0):
     """Batch pull: heartbeat + ready work + cursor-based deliveries + runs."""
+    if not isinstance(since_event_id, int) or isinstance(since_event_id, bool) or since_event_id < 0:
+        raise HubError("invalid_cursor", "since_event_id must be a non-negative integer")
     conn = get_db()
 
     def _write(c):
@@ -1201,8 +1307,27 @@ def agent_sync(actor_agent_id, session_id, since_event_id=0):
         ready_work = storage.list_ready_work_items(c, agent_id=actor_agent_id, limit=10)
         active_runs = storage.list_runs_for_agent(c, actor_agent_id, status="running")
         offered_runs = storage.list_runs_for_agent(c, actor_agent_id, status="offered")
+        stored_cursor = storage.get_consumer_cursor(c, "agent", actor_agent_id)
+        effective_cursor = max(since_event_id, stored_cursor)
         deliveries = storage.list_deliveries_since(
-            c, "agent", actor_agent_id, since_event_id=since_event_id, limit=50)
+            c, "agent", actor_agent_id, since_event_id=effective_cursor, limit=50)
+        storage.mark_deliveries_observed(
+            c, [delivery["delivery_id"] for delivery in deliveries]
+        )
+        observed_event_id = max(
+            [effective_cursor] + [int(delivery["event_id"]) for delivery in deliveries]
+        )
+        storage.advance_consumer_cursor(
+            c, "agent", actor_agent_id, observed_event_id
+        )
+        backlog = c.execute(
+            """SELECT COUNT(*) AS pending,
+                      SUM(CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END) AS unobserved,
+                      MIN(available_at) AS oldest_pending
+               FROM deliveries
+               WHERE recipient_kind='agent' AND recipient_id=? AND status='pending'""",
+            (actor_agent_id,),
+        ).fetchone()
         pending_approvals = storage.list_pending_approvals_for_agent(c, actor_agent_id)
         task_summaries = storage.list_tasks_for_agent(c, actor_agent_id, limit=20)
 
@@ -1220,6 +1345,13 @@ def agent_sync(actor_agent_id, session_id, since_event_id=0):
                                    for a in pending_approvals],
             "tasks": [_task_dict(task) for task in task_summaries],
             "latest_event_id": latest_event_id,
+            "delivery_state": {
+                "observation_cursor": observed_event_id,
+                "pending": backlog["pending"] if backlog else 0,
+                "unobserved": (backlog["unobserved"] or 0) if backlog else 0,
+                "oldest_pending": backlog["oldest_pending"] if backlog else None,
+                "ack_required": True,
+            },
             "session_lease_expires_at": iso_plus_seconds(DEFAULT_SESSION_LEASE),
         }
 
@@ -1239,6 +1371,37 @@ def ack_delivery(actor_agent_id, delivery_id):
 
     write_executor.execute_write(conn, _write)
     return {"delivery_id": delivery_id, "status": "acked"}
+
+
+def ack_deliveries(actor_agent_id, delivery_ids):
+    """Idempotently acknowledge a bounded delivery batch for one agent."""
+    if not isinstance(delivery_ids, list) or not delivery_ids:
+        raise HubError("invalid_delivery_ids", "delivery_ids must be a non-empty list")
+    if len(delivery_ids) > MAX_DELIVERY_ACK_BATCH:
+        raise HubError(
+            "delivery_batch_too_large",
+            f"at most {MAX_DELIVERY_ACK_BATCH} deliveries may be acknowledged at once",
+        )
+    if any(not isinstance(item, str) or not item for item in delivery_ids):
+        raise HubError("invalid_delivery_ids", "every delivery_id must be a non-empty string")
+    conn = get_db()
+
+    def _write(c):
+        result = storage.ack_deliveries(c, delivery_ids, actor_agent_id)
+        if result is None:
+            raise HubError(
+                "delivery_not_found",
+                "one or more deliveries do not exist or belong to another agent",
+            )
+        return result
+
+    acked, already_final = write_executor.execute_write(conn, _write)
+    return {
+        "requested": len(set(delivery_ids)),
+        "acked": acked,
+        "already_final": already_final,
+        "status": "acked",
+    }
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1298,6 +1461,13 @@ def reconcile():
         expired_locks = storage.expire_stale_locks(c)
         expired_coordinators = storage.expire_stale_coordinators(c)
         requeued_outbox = storage.requeue_expired_outbox_leases(c)
+        delivery_cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(days=DELIVERY_TERMINAL_RETENTION_DAYS)
+        ).isoformat()
+        archived_deliveries = storage.archive_terminal_task_deliveries(
+            c, delivery_cutoff
+        )
 
         for run_id in lost_run_ids:
             run = storage.get_run(c, run_id)
@@ -1350,12 +1520,33 @@ def reconcile():
                       payload={"agent_id": expired["coordinator_agent_id"]},
                       deliver_to=[("agent", task.created_by_agent_id)])
 
+        expired_approvals = storage.list_expired_pending_approvals(c)
+        for approval in expired_approvals:
+            task = storage.get_task(c, approval.task_id)
+            if task:
+                _emit(
+                    c,
+                    task.id,
+                    "approval.expired_attention",
+                    work_item_id=approval.work_item_id,
+                    run_id=approval.run_id,
+                    payload={
+                        "approval_id": approval.id,
+                        "action": approval.action,
+                        "expires_at": approval.expires_at,
+                    },
+                    deliver_to=[("agent", task.created_by_agent_id)],
+                )
+            storage.mark_approval_reminded(c, approval.id)
+
         return {
             "expired_sessions": expired_sessions,
             "lost_runs": len(lost_run_ids),
             "expired_locks": expired_locks,
             "expired_coordinators": len(expired_coordinators),
             "requeued_outbox": requeued_outbox,
+            "archived_terminal_deliveries": archived_deliveries,
+            "expired_approval_attention": len(expired_approvals),
             "dispatched": dispatched,
             "deadline_tasks": len(deadline_tasks),
         }
@@ -1380,7 +1571,9 @@ def _process_outbox():
                 continue
             adapter_id = item.get("adapter_id")
             if not adapter_id:
-                storage.mark_outbox_delivered(c, item["id"])
+                storage.mark_outbox_delivered(
+                    c, item["id"], resolution="no_adapter"
+                )
                 delivered += 1
                 continue
             adapter = storage.get_adapter(c, adapter_id)
@@ -1392,7 +1585,9 @@ def _process_outbox():
                     storage.retry_outbox(c, item["id"], "adapter_not_found", 30)
                 continue
             if adapter.mode in ("manual_resume", "online_session"):
-                storage.mark_outbox_delivered(c, item["id"])
+                storage.mark_outbox_delivered(
+                    c, item["id"], resolution="durable_backlog"
+                )
                 storage.update_adapter_health(c, adapter.id, True)
                 delivered += 1
             # resident_runner/webhook stay pending until adapter_poll leases them.
@@ -1426,6 +1621,58 @@ def hub_status():
         "SELECT COUNT(*) AS n FROM outbox WHERE status='pending'").fetchone()
     pending_deliveries = conn.execute(
         "SELECT COUNT(*) AS n FROM deliveries WHERE status='pending'").fetchone()
+    delivery_health = conn.execute(
+        """SELECT
+               SUM(CASE WHEN status='pending' AND observed_at IS NULL THEN 1 ELSE 0 END)
+                   AS pending_unobserved,
+               SUM(CASE WHEN status='pending' AND observed_at IS NOT NULL THEN 1 ELSE 0 END)
+                   AS pending_observed,
+               MIN(CASE WHEN status='pending' THEN available_at END) AS oldest_pending
+           FROM deliveries"""
+    ).fetchone()
+    delivery_backlog_by_recipient = [
+        dict(row) for row in conn.execute(
+            """SELECT recipient_kind, recipient_id, COUNT(*) AS pending,
+                      MIN(available_at) AS oldest_pending
+               FROM deliveries WHERE status='pending'
+               GROUP BY recipient_kind, recipient_id
+               ORDER BY pending DESC LIMIT 10"""
+        ).fetchall()
+    ]
+    attention_cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=TASK_ATTENTION_HOURS)
+    ).isoformat()
+    task_attention = conn.execute(
+        """SELECT
+               SUM(CASE WHEN status='running' AND coordinator_agent_id IS NULL THEN 1 ELSE 0 END)
+                   AS running_without_coordinator,
+               SUM(CASE WHEN status IN ('planned','ready','running','verifying','blocked')
+                              AND updated_at < ? THEN 1 ELSE 0 END)
+                   AS stale_active_tasks
+           FROM tasks""",
+        (attention_cutoff,),
+    ).fetchone()
+    stale_reviews = conn.execute(
+        """SELECT COUNT(*) AS n FROM work_items
+           WHERE status='reviewing' AND updated_at < ?""",
+        (attention_cutoff,),
+    ).fetchone()
+    expired_approvals = conn.execute(
+        """SELECT COUNT(*) AS n FROM approvals
+           WHERE decision IS NULL AND expires_at IS NOT NULL AND expires_at < ?""",
+        (now_iso(),),
+    ).fetchone()
+    legacy_pending_approvals = conn.execute(
+        """SELECT COUNT(*) AS n FROM approvals
+           WHERE decision IS NULL AND expires_at IS NULL"""
+    ).fetchone()
+    outbox_by_resolution = {
+        (row["resolution"] or "unresolved"): row["n"]
+        for row in conn.execute(
+            """SELECT resolution, COUNT(*) AS n FROM outbox
+               GROUP BY resolution"""
+        ).fetchall()
+    }
 
     migrations = get_applied_migrations(conn)
 
@@ -1438,7 +1685,36 @@ def hub_status():
             "stale_sessions": stale_sessions["n"] if stale_sessions else 0,
             "pending_outbox": pending_outbox["n"] if pending_outbox else 0,
             "pending_deliveries": pending_deliveries["n"] if pending_deliveries else 0,
+            "pending_deliveries_unobserved": (
+                delivery_health["pending_unobserved"] or 0
+                if delivery_health else 0
+            ),
+            "pending_deliveries_observed_unacked": (
+                delivery_health["pending_observed"] or 0
+                if delivery_health else 0
+            ),
+            "oldest_pending_delivery": (
+                delivery_health["oldest_pending"] if delivery_health else None
+            ),
+            "delivery_backlog_by_recipient": delivery_backlog_by_recipient,
+            "running_tasks_without_coordinator": (
+                task_attention["running_without_coordinator"] or 0
+                if task_attention else 0
+            ),
+            "stale_active_tasks": (
+                task_attention["stale_active_tasks"] or 0
+                if task_attention else 0
+            ),
+            "stale_reviews": stale_reviews["n"] if stale_reviews else 0,
+            "expired_pending_approvals": (
+                expired_approvals["n"] if expired_approvals else 0
+            ),
+            "legacy_pending_approvals": (
+                legacy_pending_approvals["n"] if legacy_pending_approvals else 0
+            ),
             "outbox_by_status": storage.count_outbox_by_status(conn),
+            "outbox_by_resolution": outbox_by_resolution,
+            "attention_threshold_hours": TASK_ATTENTION_HOURS,
             "last_reconcile_at": _RUNTIME_STATE["last_reconcile_at"],
             "last_reconcile_result": _RUNTIME_STATE["last_reconcile_result"],
         },

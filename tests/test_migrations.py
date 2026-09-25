@@ -12,7 +12,7 @@ def test_migrations_applied(db_path):
     conn = db.get_db(db_path)
     migrations = get_applied_migrations(conn)
     versions = [m["version"] for m in migrations]
-    assert 1 in versions
+    assert versions == [1, 2]
 
 
 def test_migrations_idempotent(db_path):
@@ -36,13 +36,27 @@ def test_all_tables_exist(db_path):
         "schema_migrations", "agents", "adapters", "sessions", "tasks",
         "work_items", "work_dependencies", "runs", "checkpoints", "artifacts",
         "events", "deliveries", "outbox", "approvals", "resource_locks",
-        "task_participants", "sequences",
+        "task_participants", "sequences", "consumer_cursors",
     ]
     for table in expected:
         row = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
             (table,)).fetchone()
         assert row is not None, f"Table '{table}' missing"
+
+
+def test_operational_hardening_columns_exist(db_path):
+    conn = db.get_db(db_path)
+    expected = {
+        "deliveries": {"observed_at", "archived_at"},
+        "outbox": {"resolution"},
+        "approvals": {"expires_at", "reminder_count", "last_reminded_at"},
+    }
+    for table, names in expected.items():
+        columns = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        assert names <= columns
 
 
 def test_sql_split_handles_comments():

@@ -7,7 +7,8 @@ authorization is enforced separately in the service layer.
 from __future__ import annotations
 
 import hashlib
-import time
+import hmac
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -15,22 +16,30 @@ CONFIG_DIR = Path.home() / ".config" / "agent-hub"
 TOKEN_FILE = CONFIG_DIR / "agents.env"
 
 _tokens_cache: Optional[dict[str, str]] = None
-_tokens_mtime: float = 0.0
+_tokens_signature: tuple[int, int] = (0, 0)
 
 
 def load_tokens() -> dict[str, str]:
     """Load agent tokens from agents.env, cached with mtime check."""
-    global _tokens_cache, _tokens_mtime
+    global _tokens_cache, _tokens_signature
     try:
-        mtime = TOKEN_FILE.stat().st_mtime if TOKEN_FILE.exists() else 0.0
+        stat_result = TOKEN_FILE.stat() if TOKEN_FILE.exists() else None
+        signature = (
+            (stat_result.st_mtime_ns, stat_result.st_size)
+            if stat_result else (0, 0)
+        )
     except OSError:
-        mtime = 0.0
+        signature = (0, 0)
 
-    if _tokens_cache is not None and mtime == _tokens_mtime:
+    if _tokens_cache is not None and signature == _tokens_signature:
         return _tokens_cache
 
     tokens = {}
     if TOKEN_FILE.exists():
+        if os.name == "posix" and TOKEN_FILE.stat().st_mode & 0o077:
+            raise PermissionError(
+                f"Token file must not be group/world accessible: {TOKEN_FILE}"
+            )
         with open(TOKEN_FILE, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -41,7 +50,7 @@ def load_tokens() -> dict[str, str]:
                     tokens[agent_id.strip()] = token.strip().strip('"').strip("'")
 
     _tokens_cache = tokens
-    _tokens_mtime = mtime
+    _tokens_signature = signature
     return tokens
 
 
@@ -56,6 +65,6 @@ def verify_token(bearer_token: str) -> Optional[str]:
     raw_token = bearer_token[7:]
     tokens = load_tokens()
     for agent_id, expected in tokens.items():
-        if raw_token == expected:
+        if hmac.compare_digest(raw_token, expected):
             return agent_id
     return None
