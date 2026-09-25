@@ -18,7 +18,6 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ProtectKernelTunables=yes
-ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
