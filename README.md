@@ -95,18 +95,29 @@ Task (sole aggregate root)
 
 ## Quick Start
 
-### 1. Install (WSL)
+### 1. Install the server from source (WSL)
 
 ```bash
+git clone https://github.com/mazhengeod/agent-hub.git
+cd agent-hub
 python3 -m venv .venv
-.venv/bin/pip install agent-hub-mcp
+.venv/bin/pip install .
 mkdir -p ~/.config/agent-hub
-cp /path/to/config.example.yaml ~/.config/agent-hub/config.yaml
+cp config.example.yaml ~/.config/agent-hub/config.yaml
 ```
+
+This installs the Python server implementation from the checked-out release. It
+does not install an npm client connector. The npm connector is not required for
+clients with native MCP Streamable HTTP support and is currently not part of
+the supported setup.
 
 Create `~/.config/agent-hub/agents.env` with one `agent_id=token` entry per
 agent. Tokens are read only from the HTTP `Authorization: Bearer ...` header;
 they are never MCP tool arguments.
+
+Agents connect to `http://127.0.0.1:8765/mcp` using native MCP Streamable HTTP.
+See [INTEGRATION.md](INTEGRATION.md) for Codex configuration, the v0.6 session
+lifecycle, migration instructions, and acceptance checks.
 
 ### 2. Back up and start
 
