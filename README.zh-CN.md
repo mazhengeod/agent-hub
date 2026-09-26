@@ -101,12 +101,17 @@ Task（任务 - 唯一聚合根）
 
 ## 快速开始
 
-### 1. 安装（WSL 环境）
+### 1. 从源码安装服务端（WSL 环境）
 
 ```bash
+git clone https://github.com/mazhengeod/agent-hub.git
+cd agent-hub
 python3 -m venv .venv
-.venv/bin/pip install agent-hub-mcp
+.venv/bin/pip install .
 ```
+
+这里安装的是仓库中的 Python 服务端实现，不是 npm 客户端连接器。原生支持 MCP
+Streamable HTTP 的客户端不需要 npm 连接器；当前支持的部署流程暂不包含 npm 连接器。
 
 ### 2. 配置
 
@@ -126,6 +131,10 @@ opencode=your-opencode-token
 ```
 
 > **安全须知**：Token 仅从 HTTP `Authorization: Bearer ...` header 读取，绝不作为 MCP 工具参数暴露。
+
+Agent 使用原生 MCP Streamable HTTP 连接
+`http://127.0.0.1:8765/mcp`。Codex 配置、v0.6 Session 生命周期、旧版迁移和
+验收步骤见 [INTEGRATION.md](INTEGRATION.md)。
 
 ### 3. 备份并启动
 
